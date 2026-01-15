@@ -115,6 +115,15 @@ static inline bool isDumpingState(SystemState s) {
 }
 
 // =========================
+// LIMIT SWITCH MIRRORS (injected from Master / Slave2)
+// =========================
+volatile uint8_t limDoor0  = 0;
+volatile uint8_t limPush0  = 0;
+volatile uint8_t limBurn0  = 0;
+volatile uint8_t limBDoor0 = 0;
+
+
+// =========================
 // HARDWARE PINS (sesuaikan wiring kamu)
 // =========================
 #define STEP_PIN_DOOR   6
@@ -350,6 +359,67 @@ void computeMetrics() {
   // kirim batch summary ringkas
   sendToMaster(String("BATCH_SUM:") + String(totalBatchCount) + "," + String((float)currentBatchVolume, 3) + "," + String(currentWeightKg, 1) + "," + String(solarVolumeUsed_L, 2) + "," + String(currentTempC, 0) + "," + String(burnerActiveTimeSec) + ",OK");
 }
+
+static void applyLimitHoming() {
+  // Door
+  if (limDoor0) {
+    if (stepperDoor.currentPosition() != 0) stepperDoor.setCurrentPosition(0);
+    // kalau lagi coba “melewati” limit ke arah negatif, hentikan
+    if (stepperDoor.distanceToGo() != 0 && stepperDoor.targetPosition() < stepperDoor.currentPosition()) {
+      stepperDoor.stop();
+      stepperDoor.moveTo(0);
+    }
+  }
+
+  // Push
+  if (limPush0) {
+    if (stepperPush.currentPosition() != 0) stepperPush.setCurrentPosition(0);
+    if (stepperPush.distanceToGo() != 0 && stepperPush.targetPosition() < stepperPush.currentPosition()) {
+      stepperPush.stop();
+      stepperPush.moveTo(0);
+    }
+  }
+
+  // Burner
+  if (limBurn0) {
+    if (stepperBurner.currentPosition() != 0) stepperBurner.setCurrentPosition(0);
+    if (stepperBurner.distanceToGo() != 0 && stepperBurner.targetPosition() < stepperBurner.currentPosition()) {
+      stepperBurner.stop();
+      stepperBurner.moveTo(0);
+    }
+  }
+
+  // BurnDoor
+  if (limBDoor0) {
+    if (stepperBurnDoor.currentPosition() != 0) stepperBurnDoor.setCurrentPosition(0);
+    if (stepperBurnDoor.distanceToGo() != 0 && stepperBurnDoor.targetPosition() < stepperBurnDoor.currentPosition()) {
+      stepperBurnDoor.stop();
+      stepperBurnDoor.moveTo(0);
+    }
+  }
+}
+
+static void applyLimitsSnapshot(const String &valStr) {
+  // format: d,p,b,bd (0/1)
+  int c1 = valStr.indexOf(',');
+  int c2 = valStr.indexOf(',', c1 + 1);
+  int c3 = valStr.indexOf(',', c2 + 1);
+  if (c1 < 0 || c2 < 0 || c3 < 0) return;
+
+  int d  = valStr.substring(0, c1).toInt();
+  int p  = valStr.substring(c1 + 1, c2).toInt();
+  int b  = valStr.substring(c2 + 1, c3).toInt();
+  int bd = valStr.substring(c3 + 1).toInt();
+
+  limDoor0  = (d  != 0);
+  limPush0  = (p  != 0);
+  limBurn0  = (b  != 0);
+  limBDoor0 = (bd != 0);
+
+  // langsung apply biar posisi 0 “nempel”
+  applyLimitHoming();
+}
+
 
 // =========================
 // PROGRESS (full-ish, match reference)
@@ -773,17 +843,18 @@ void runAllSteppers() {
     return;
   }
 
+  applyLimitHoming();
+
   stepperDoor.run();
   stepperPush.run();
   stepperAsh.run();
   stepperBurner.run();
   stepperBurnDoor.run();
-
-  // conveyor always runSpeed (speed 0 = stop)
   stepperMainConveyor.runSpeed();
 
   refreshEnablePin(currentState);
 }
+
 
 // =========================
 // MANUAL MOVE
@@ -884,6 +955,12 @@ void handleCommand(String cmd) {
   int colon = cmd.indexOf(':');
   String header = (colon >= 0) ? cmd.substring(0, colon) : cmd;
   String valStr = (colon >= 0) ? cmd.substring(colon + 1) : String("");
+  
+  // ---- limits snapshot ----
+  if (header == "CMD_LIMITS") {
+    applyLimitsSnapshot(valStr);
+    return;
+  }
 
   // ---- sensor snapshot ----
   if (header == "CMD_SENSOR_SNAPSHOT") {
