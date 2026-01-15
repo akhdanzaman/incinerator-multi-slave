@@ -1,18 +1,18 @@
 #include <Arduino.h>
+#include "HX711.h"
 
 // =========================
-// SLAVE2 - LIMIT SWITCH NODE | RS485 Simple ASCII
+// NODE / RS485
 // =========================
-
 static const uint8_t NODE_ID = 2;
 static const int PIN_RS485_DE = 4;
 static const int RS485_RX = 16;
 static const int RS485_TX = 17;
 
 struct RS485Simple {
-  HardwareSerial *ser;
-  int pinDE;
-  uint32_t baud;
+  HardwareSerial *ser = nullptr;
+  int pinDE = -1;
+  uint32_t baud = 9600;
 
   void begin(HardwareSerial &s, uint32_t b, int rx, int tx, int dePin) {
     ser = &s;
@@ -52,16 +52,42 @@ RS485Simple bus;
 String rxLine;
 
 // =========================
-// LIMIT PINS (ubah sesuai wiring)
+// HX711
 // =========================
+// HX711 pins (ubah sesuai wiring)
+static const int HX711_DT  = 32;
+static const int HX711_SCK = 33;
+
+HX711 scale;
+float scale_factor = 2123.157f;
+
+// smoothing EMA
+static float wEma = 0;
+static bool  wInit = false;
+static const float W_ALPHA = 0.18f;
+
+// =========================
+// LIMIT SWITCH (ubah sesuai wiring)
+// =========================
+// aktif LOW (INPUT_PULLUP)
 static const int LIM_DOOR  = 25;
 static const int LIM_PUSH  = 26;
 static const int LIM_BURN  = 27;
 static const int LIM_BDOOR = 14;
 
-// aktif LOW (INPUT_PULLUP)
 static inline uint8_t limActive(int pin) { return (digitalRead(pin) == LOW) ? 1 : 0; }
 
+// debounce
+static const uint32_t DEBOUNCE_MS = 25;
+uint8_t stDoor=0, stPush=0, stBurn=0, stBDoor=0;
+uint8_t lastSentDoor=255, lastSentPush=255, lastSentBurn=255, lastSentBDoor=255;
+
+uint8_t rdDoor=0, rdPush=0, rdBurn=0, rdBDoor=0;
+uint32_t tDoor=0, tPush=0, tBurn=0, tBDoor=0;
+
+// =========================
+// TX helpers
+// =========================
 static inline void sendToMaster(const String &payload) {
   char hdr[8];
   snprintf(hdr, sizeof(hdr), "N%02u:", (unsigned)NODE_ID);
@@ -69,6 +95,7 @@ static inline void sendToMaster(const String &payload) {
 }
 
 static bool parseToFrame(const String &line, uint8_t &idOut, String &payloadOut) {
+  // Expect: TOxx:payload
   if (line.length() < 6) return false;
   if (!(line[0] == 'T' && line[1] == 'O')) return false;
   char d1 = line[2], d2 = line[3];
@@ -80,19 +107,32 @@ static bool parseToFrame(const String &line, uint8_t &idOut, String &payloadOut)
 }
 
 // =========================
-// Debounce + change detect
+// HX711 read
 // =========================
-static const uint32_t DEBOUNCE_MS = 25;
+float readWeightKg() {
+  if (!scale.is_ready()) return NAN;
 
-uint8_t stDoor=0, stPush=0, stBurn=0, stBDoor=0;
-uint8_t lastSentDoor=255, lastSentPush=255, lastSentBurn=255, lastSentBDoor=255;
+  float w = scale.get_units(1);
+  if (!isfinite(w)) return NAN;
 
-uint8_t rdDoor=0, rdPush=0, rdBurn=0, rdBDoor=0;
-uint32_t tDoor=0, tPush=0, tBurn=0, tBDoor=0;
+  if (!wInit) { wInit = true; wEma = w; }
+  wEma = (W_ALPHA * w) + ((1.0f - W_ALPHA) * wEma);
 
+  if (wEma < 0 && wEma > -0.2f) wEma = 0;
+  return wEma;
+}
+
+static void sendWeightNow() {
+  float w = readWeightKg();
+  if (isfinite(w)) sendToMaster(String("WEIGHT:") + String(w, 2));
+  else sendToMaster("WEIGHT:NaN");
+}
+
+// =========================
+// LIMIT sampling
+// =========================
 static void sampleLimitsDebounced() {
   uint32_t now = millis();
-
   uint8_t r;
 
   r = limActive(LIM_DOOR);
@@ -124,17 +164,32 @@ static void sendLimitsNow() {
   lastSentBDoor = stBDoor;
 }
 
-static void sendOnChange() {
+static void sendLimitsOnChange() {
   if (stDoor!=lastSentDoor || stPush!=lastSentPush || stBurn!=lastSentBurn || stBDoor!=lastSentBDoor) {
     sendLimitsNow();
   }
 }
 
 // =========================
-// RX handler
+// RX payload handler
 // =========================
 static void handlePayload(const String &payload) {
+  if (payload == "REQ_WEIGHT") {
+    sendWeightNow();
+    return;
+  }
+  if (payload == "TARE") {
+    scale.tare(20);
+    wInit = false; // reset EMA biar ga “nyangkut”
+    sendToMaster("LOG:INFO,HX711,TARED");
+    return;
+  }
   if (payload == "REQ_LIMITS") {
+    sendLimitsNow();
+    return;
+  }
+  if (payload == "REQ_ALL") {
+    sendWeightNow();
     sendLimitsNow();
     return;
   }
@@ -142,11 +197,13 @@ static void handlePayload(const String &payload) {
     sendToMaster("PONG");
     return;
   }
+
+  sendToMaster(String("LOG:WARN,UNK,") + payload);
 }
 
 static void processRx() {
   while (bus.readLine(rxLine)) {
-    uint8_t id=0;
+    uint8_t id = 0;
     String payload;
     if (!parseToFrame(rxLine, id, payload)) { rxLine=""; continue; }
     if (id != NODE_ID) { rxLine=""; continue; }
@@ -155,29 +212,48 @@ static void processRx() {
   }
 }
 
+// =========================
+// setup / loop
+// =========================
 void setup() {
   Serial.begin(115200);
   bus.begin(Serial1, 9600, RS485_RX, RS485_TX, PIN_RS485_DE);
 
+  // HX711
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(scale_factor);
+  scale.tare(20);
+
+  // Limits
   pinMode(LIM_DOOR,  INPUT_PULLUP);
   pinMode(LIM_PUSH,  INPUT_PULLUP);
   pinMode(LIM_BURN,  INPUT_PULLUP);
   pinMode(LIM_BDOOR, INPUT_PULLUP);
 
   sampleLimitsDebounced();
-  sendToMaster("LOG:INFO,BOOT,SLAVE2_LIMIT_READY");
+
+  sendToMaster("LOG:INFO,BOOT,SLAVE2_HX711_LIMIT_READY");
   sendLimitsNow();
+  sendWeightNow();
 }
 
 void loop() {
   processRx();
 
-  static uint32_t lastPoll=0;
+  // Limit polling cepat + change detect
+  static uint32_t lastLimPoll = 0;
   uint32_t now = millis();
-
-  if (now - lastPoll >= 5) { // cepat biar responsif
-    lastPoll = now;
+  if (now - lastLimPoll >= 5) {
+    lastLimPoll = now;
     sampleLimitsDebounced();
-    sendOnChange();
+    sendLimitsOnChange();
+  }
+
+  // OPTIONAL: weight telemetry periodik (biar master ga perlu request terus)
+  // Kalau kamu ga mau periodik, set interval besar atau comment block ini.
+  static uint32_t lastWTx = 0;
+  if (now - lastWTx >= 500) {
+    lastWTx = now;
+    sendWeightNow();
   }
 }
