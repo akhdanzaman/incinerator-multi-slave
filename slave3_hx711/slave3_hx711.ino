@@ -16,6 +16,9 @@ static const int RS485_TX = 26;
 
 byte outX1, outX2, outY1, outY2;   // hasil konversi 7 Segment siap pakai
 float weightValue = 0;
+static float lastGood = 0;
+static float lastShown = 0;
+float v = weightValue;
 
 //Dibuat 3 fungsi Array untuk mapping tiap-tiap digit karena setiap digit pada seven segment punya maping yang berbeda-beda
 byte segDigit14[10] = { //maping untuk digit 1 dan 4
@@ -62,10 +65,24 @@ void sendByte(byte b) {
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, b);
   digitalWrite(LATCH_PIN, HIGH);
 }
+static inline void send4Bytes(byte b1, byte b2, byte b3, byte b4) {
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, b1);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, b2);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, b3);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, b4);
+  digitalWrite(LATCH_PIN, HIGH);
+}
 
 void convertMassValueto7Segment(float massValue) {
 
   // --- ERROR CHECK ---
+
+   // Reject NaN/Inf dulu
+  if (!isfinite(massValue)) {
+    pesanError();          // atau tampilkan blank
+    return;
+  }
   // Jika suhu melebihi batas aman → tampilkan pesan error
   if (massValue > 100.0f) {
     pesanError();
@@ -107,10 +124,13 @@ void convertMassValueto7Segment(float massValue) {
   tOut4 = segDigit14[tX4];
 
   // Kirim ke driver seven segment
-  sendByte(~tOut1);
-  sendByte(~tOut2);
-  sendByte(~tOut3);
-  sendByte(~tOut4);
+  send4Bytes(~tOut1, ~tOut2, ~tOut3, ~tOut4);
+
+}
+
+void showWeightSafe(float v) {
+  if (isfinite(v) && v >= 0 && v <= 100.0f) lastGood = v;
+  convertMassValueto7Segment(lastGood);
 }
 
 void pesanError(){
@@ -119,10 +139,8 @@ void pesanError(){
   byte hurufR1= 0b01111100; 
   byte hurufR2= 0b10101011; 
   
-  sendByte(~tandaMin); 
-  sendByte(~hurufE); 
-  sendByte(~hurufR1); 
-  sendByte(~hurufR2); 
+  send4Bytes(~tandaMin, ~hurufE, ~hurufR1, ~hurufR2);
+
 }
 
 void startupBlink() {
@@ -196,7 +214,7 @@ static const int HX711_DT  = 21;
 static const int HX711_SCK = 22;
 
 HX711 scale;
-float scale_factor = 2123.157f;
+float scale_factor = 2187.7f;
 
 // smoothing EMA
 static float wEma = 0;
@@ -381,6 +399,7 @@ void setup() {
 
 void loop() {
   processRx();
+  showWeightSafe(weightValue);
 
   // Limit polling cepat + change detect
   static uint32_t lastLimPoll = 0;
@@ -397,6 +416,17 @@ void loop() {
   if (now - lastWTx >= 500) {
     lastWTx = now;
     sendWeightNow();
+
+    float v = weightValue;
+
+  // ---- BONUS FILTER (ANTI SPIKE) ----
+  if (isfinite(v)) {
+    if (fabs(v - lastShown) < 10.0f) {   // batas lonjakan (kg)
+      lastShown = v;
+    }
+  }
+  // ----------------------------------
+    
   convertMassValueto7Segment(weightValue);
   }
 }
