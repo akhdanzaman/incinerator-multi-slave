@@ -1,7 +1,7 @@
 /*
  * MCU-HMI (Nextion Controller) ESP32  |  RS485 Multi-Slave (Simple ASCII)a
  * --------------------------------------------------------------------
- * Kamu minta versi "lengkap" dsfd(objek HMI + callback + parsing) tapi komunikasi ke jaringan
+ * Kamu minta versi "lengkap" (objek HMI + callback + parsing) tapi komunikasi ke jaringan
  * pakai RS485 (MAX485) dan siap multi-slave.
  *
  * Catatan penting (biar nggak jadi ritual debug tengah malam):
