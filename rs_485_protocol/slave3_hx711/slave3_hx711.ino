@@ -9,7 +9,7 @@
 #define CLOCK_PIN 13
 #define LATCH_PIN 12
 
-static const uint8_t NODE_ID = 2;
+static const uint8_t NODE_ID = 3;
 static const int PIN_RS485_DE = 4;
 static const int RS485_RX = 25;
 static const int RS485_TX = 26;
