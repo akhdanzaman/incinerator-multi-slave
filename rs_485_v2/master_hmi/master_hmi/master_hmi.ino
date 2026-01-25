@@ -28,6 +28,15 @@
  * - Sekarang pakai event default Nextion: Touch Event 0x65 (65 pp cc ee FF FF FF)
  * - Tidak perlu setting event script apa pun di Nextion.
  * - Kamu cukup isi DEFINE component id & page id sesuai desain HMI kamu.
+ *
+ * PERBAIKAN SETPOINT TEXT + TOMBOL UP/DOWN:
+ * - nTempSet, nTimeSet, t2, t1 adalah OBJECT TEXT (bukan number).
+ * - Nilai dibaca dari Nextion saat dibutuhkan via: get <obj>.txt  -> return 0x70 + string + FFF
+ * - Tombol up/down untuk tiap setpoint:
+ *     - Ambil nilai text (fallback ke g.* jika gagal)
+ *     - Tambah/kurang sesuai step
+ *     - Tulis balik ke text object (obj.txt="...")
+ *     - Update g.* agar SAVE selalu kirim value terbaru
  */
 
 #include <Arduino.h>
@@ -237,11 +246,11 @@ static const char *OBJ_M_BLOW_A = "b8";
 static const char *OBJ_M_BLOW_C = "b9";
 static const char *OBJ_M_STOP   = "b5";
 
-// SETTINGS
-static const char *OBJ_S_TSET   = "nTempSet";
-static const char *OBJ_S_TIME   = "nTimeSet";
-static const char *OBJ_S_WB     = "t2";     // setpoint berat/batch
-static const char *OBJ_S_VOL    = "t1";     // setpoint volume
+// SETTINGS (NOTE: semua ini TEXT object di HMI kamu)
+static const char *OBJ_S_TSET   = "nTempSet"; // TEXT
+static const char *OBJ_S_TIME   = "nTimeSet"; // TEXT
+static const char *OBJ_S_WB     = "t2";       // TEXT (berat/batch)
+static const char *OBJ_S_VOL    = "t1";       // TEXT (volume)
 static const char *OBJ_S_BLOW1T = "tBlow1txt";
 static const char *OBJ_S_BLOW2T = "tBlow2txt";
 static const char *OBJ_S_SAVE   = "bSave";
@@ -280,10 +289,6 @@ static String fmt2(float v) {
 //
 // Kamu cukup set page id & component id (di Nextion editor sudah ada fieldnya).
 // Tidak perlu script event sama sekali.
-//
-// NOTE:
-// - Nextion juga bisa mengirim return lain (0x66, 0x70, 0x71, error, dsb).
-//   Parser ini akan sinkronisasi dan hanya memicu saat frame 0x65 valid.
 
 // ---- isi sendiri sesuai HMI kamu ----
 // PAGE IDs
@@ -299,23 +304,31 @@ static String fmt2(float v) {
 #define NEX_CID_bManDoor     0   // <- isi
 #define NEX_CID_bManBDoor    0   // <- isi
 #define NEX_CID_bManPush     0   // <- isi
-#define NEX_CID_bManCon      0   // <- isi (bisa cycle/segmented button)
+#define NEX_CID_bManCon      0   // <- isi
 #define NEX_CID_btManIgn     0   // <- isi
 #define NEX_CID_btManBum     0   // <- isi
-#define NEX_CID_hManSpeed    0   // <- isi (slider)
-#define NEX_CID_hManStep     0   // <- isi (slider)
-#define NEX_CID_b5Stop       0   // <- isi (stop di page manual)
+#define NEX_CID_hManSpeed    0   // <- isi
+#define NEX_CID_hManStep     0   // <- isi
+#define NEX_CID_b5Stop       0   // <- isi
 
 // SETTINGS component IDs
 #define NEX_CID_bSave         0   // <- isi
 #define NEX_CID_bReset        0   // <- isi
 #define NEX_CID_bsettingStop  0   // <- isi
-#define NEX_CID_nTempSet      0   // <- isi (number)
-#define NEX_CID_nTimeSet      0   // <- isi (number)
-#define NEX_CID_t2Batch       0   // <- isi (text/number)
-#define NEX_CID_t1Vol         0   // <- isi (text/number)
-#define NEX_CID_bBlow1        0   // <- isi (button)
-#define NEX_CID_bBlow2        0   // <- isi (button)
+
+// Setpoint buttons (UP/DOWN) (sesuai screenshot kamu)
+#define NEX_CID_bTempUp       0   // <- isi (bTempUp)
+#define NEX_CID_bTempDn       0   // <- isi (bTempD)
+#define NEX_CID_bTimeUp       0   // <- isi (bTimeUp)
+#define NEX_CID_bTimeDn       0   // <- isi (bTimeD)
+#define NEX_CID_bBatchUp      0   // <- isi (b2)
+#define NEX_CID_bBatchDn      0   // <- isi (b4)
+#define NEX_CID_bVolUp        0   // <- isi (b1)
+#define NEX_CID_bVolDn        0   // <- isi (b0)
+
+// Blower buttons
+#define NEX_CID_bBlow1        0   // <- isi (bBlow1)
+#define NEX_CID_bBlow2        0   // <- isi (bBlow2)
 
 // -----------------------------------------------------
 // Default touch frame reader (robust sync)
@@ -352,13 +365,135 @@ static bool nexReadTouch(uint8_t &page, uint8_t &comp, uint8_t &evt) {
   return false;
 }
 
-// OPTIONAL: baca numeric/text return jika kamu nanti mau tanpa script.
-// Saat ini tidak dipakai (tetap ada, tidak mengganggu).
 static void nexDrainNonTouchReturns(unsigned long maxMs) {
   unsigned long t0 = millis();
   while (nexSerial.available() && (millis() - t0) < maxMs) {
     (void)nexSerial.read();
   }
+}
+
+// =====================================================
+// NEXTION GET TEXT (0x70) helpers (untuk object TEXT)
+// =====================================================
+static bool nexGetTxtBlocking(const char* objDotTxt, String &out, uint32_t timeoutMs = 140) {
+  // bersihin input biar gak ketuker return lama
+  while (nexSerial.available()) (void)nexSerial.read();
+
+  // kirim query
+  String cmd = String("get ") + objDotTxt; // ex: get nTempSet.txt
+  nexCmd(cmd);
+
+  // tunggu return 0x70 + <string bytes> + FFF
+  out = "";
+  unsigned long t0 = millis();
+  bool started = false;
+
+  while ((millis() - t0) < timeoutMs) {
+    while (nexSerial.available()) {
+      uint8_t b = (uint8_t)nexSerial.read();
+
+      if (!started) {
+        if (b != 0x70) continue;
+        started = true;
+        continue;
+      }
+
+      // after start: capture until FFF
+      // We detect FFF by checking last 3 bytes after appending.
+      out += (char)b;
+
+      int n = out.length();
+      if (n >= 3) {
+        if ((uint8_t)out[n-1] == 0xFF && (uint8_t)out[n-2] == 0xFF && (uint8_t)out[n-3] == 0xFF) {
+          out.remove(n-3); // drop terminator
+          out.trim();
+          return true;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  return false;
+}
+
+static bool parseFloatLoose(const String &sIn, float &out) {
+  String s = sIn;
+  s.trim();
+  if (!s.length()) return false;
+  // allow commas as decimal separators, and remove non-numeric junk
+  s.replace(",", ".");
+  // Keep only digits, sign, dot
+  String t; t.reserve(s.length());
+  for (int i=0;i<(int)s.length();i++) {
+    char c = s[i];
+    if ((c>='0' && c<='9') || c=='-' || c=='+' || c=='.') t += c;
+  }
+  if (!t.length()) return false;
+  out = t.toFloat();
+  return isfinite(out);
+}
+
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void formatFloatNoTrailingZeros(float v, uint8_t decimals, char *out, size_t outSz) {
+  // decimals: 0..3 typical
+  char fmt[8];
+  snprintf(fmt, sizeof(fmt), "%%.%uf", (unsigned)decimals);
+  char buf[32];
+  snprintf(buf, sizeof(buf), fmt, (double)v);
+
+  // trim trailing zeros + dot
+  String s(buf);
+  if (decimals > 0) {
+    while (s.endsWith("0")) s.remove(s.length()-1);
+    if (s.endsWith(".")) s.remove(s.length()-1);
+  }
+  strncpy(out, s.c_str(), outSz-1);
+  out[outSz-1] = 0;
+}
+
+// ============================================
+// SETPOINT RULES (step + clamp)
+// ============================================
+static const float SP_TEMP_STEP  = 10.0f;
+static const float SP_TEMP_MIN   = 0.0f;
+static const float SP_TEMP_MAX   = 2000.0f;
+
+static const float SP_BATCH_STEP = 0.1f;
+static const float SP_BATCH_MIN  = 0.0f;
+static const float SP_BATCH_MAX  = 999.0f;
+
+static const float SP_VOL_STEP   = 0.1f;
+static const float SP_VOL_MIN    = 0.0f;
+static const float SP_VOL_MAX    = 99999.0f;
+
+static const int   SP_TIME_STEP  = 1;
+static const int   SP_TIME_MIN   = 1;
+static const int   SP_TIME_MAX   = 86400;
+
+// Helper: read a TEXT object as float, fallback to provided fallbackVal if fail.
+static float readTextAsFloatOrFallback(const char *objName, float fallbackVal) {
+  String txt;
+  if (nexGetTxtBlocking((String(objName) + ".txt").c_str(), txt)) {
+    float v;
+    if (parseFloatLoose(txt, v)) return v;
+  }
+  return fallbackVal;
+}
+
+static void writeTextValue(const char *objName, float v, uint8_t decimals) {
+  char b[32];
+  formatFloatNoTrailingZeros(v, decimals, b, sizeof(b));
+  nexSetTxt(objName, String(b));
+}
+
+static void writeTextValueInt(const char *objName, int v) {
+  nexSetTxt(objName, String(v));
 }
 
 // ======================
@@ -435,10 +570,6 @@ static void taskRsRx(void *pv) {
                   }
                 }
               } else if (id == NODE_MEGA_ACT) {
-                // optional: parse MEGA telemetry kalau kamu tambahkan nanti, contoh:
-                //  N01:STATE:IDLE
-                //  N01:FUEL:75
-                //  N01:METRICS:vol,batch,totalW
                 if (payload.startsWith("FUEL:")) {
                   int pct = payload.substring(5).toInt();
                   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
@@ -468,9 +599,7 @@ static void taskNexRx(void *pv) {
   for (;;) {
     uint8_t page = 0, comp = 0, evt = 0;
 
-    // process all available touch frames
     while (nexReadTouch(page, comp, evt)) {
-      // We act on RELEASE by default (lebih stabil, mencegah double-trigger)
       const bool isRelease = (evt == 0x00);
       if (!isRelease) continue;
 
@@ -502,8 +631,6 @@ static void taskNexRx(void *pv) {
         enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
       }
       else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManDoor) {
-        // button toggle state tidak bisa dibaca dari 0x65.
-        // default: treat as toggle local, kirim sesuai local state.
         bool open;
         if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           g.manDirOpen = !g.manDirOpen;
@@ -537,8 +664,6 @@ static void taskNexRx(void *pv) {
         enqueueRs(NODE_MEGA_ACT, maju ? "PUSHER_MAJU" : "PUSHER_MUNDUR");
       }
       else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManCon) {
-        // Tanpa script, kita tidak tahu value multi-state dari Nextion.
-        // Solusi plug-n-play: cycle state lokal: STOP -> FWD -> REV -> STOP ...
         static uint8_t convMode = 0; // 0 stop, 1 fwd, 2 rev
         convMode = (uint8_t)((convMode + 1) % 3);
         if (convMode == 0) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_STOP");
@@ -546,7 +671,6 @@ static void taskNexRx(void *pv) {
         else enqueueRs(NODE_MEGA_ACT, "CONVEYOR_REV");
       }
       else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_btManIgn) {
-        // toggle local
         static uint8_t ign = 0;
         ign ^= 1;
         enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_IGN:") + String((int)ign));
@@ -566,7 +690,104 @@ static void taskNexRx(void *pv) {
         }
         enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
       }
+
+      // --- UP/DOWN Setpoints (TEXT objects) ---
+      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bTempUp || comp == NEX_CID_bTempDn)) {
+        float cur;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTemp; xSemaphoreGive(gMutex); }
+        else cur = 1200.0f;
+
+        float v = readTextAsFloatOrFallback(OBJ_S_TSET, cur);
+        v += (comp == NEX_CID_bTempUp) ? SP_TEMP_STEP : -SP_TEMP_STEP;
+        v = clampf(v, SP_TEMP_MIN, SP_TEMP_MAX);
+
+        writeTextValue(OBJ_S_TSET, v, 0);
+
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.setTemp = v;
+          xSemaphoreGive(gMutex);
+        }
+      }
+      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bTimeUp || comp == NEX_CID_bTimeDn)) {
+        uint32_t cur;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTimeSec; xSemaphoreGive(gMutex); }
+        else cur = 30;
+
+        float f = readTextAsFloatOrFallback(OBJ_S_TIME, (float)cur);
+        int v = (int)roundf(f);
+        v += (comp == NEX_CID_bTimeUp) ? SP_TIME_STEP : -SP_TIME_STEP;
+        if (v < SP_TIME_MIN) v = SP_TIME_MIN;
+        if (v > SP_TIME_MAX) v = SP_TIME_MAX;
+
+        writeTextValueInt(OBJ_S_TIME, v);
+
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.setTimeSec = (uint32_t)v;
+          xSemaphoreGive(gMutex);
+        }
+      }
+      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bBatchUp || comp == NEX_CID_bBatchDn)) {
+        float cur;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setBatchKg; xSemaphoreGive(gMutex); }
+        else cur = 5.0f;
+
+        float v = readTextAsFloatOrFallback(OBJ_S_WB, cur);
+        v += (comp == NEX_CID_bBatchUp) ? SP_BATCH_STEP : -SP_BATCH_STEP;
+        v = clampf(v, SP_BATCH_MIN, SP_BATCH_MAX);
+
+        writeTextValue(OBJ_S_WB, v, 2);
+
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.setBatchKg = v;
+          xSemaphoreGive(gMutex);
+        }
+      }
+      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bVolUp || comp == NEX_CID_bVolDn)) {
+        float cur;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setVolume; xSemaphoreGive(gMutex); }
+        else cur = 0.0f;
+
+        float v = readTextAsFloatOrFallback(OBJ_S_VOL, cur);
+        v += (comp == NEX_CID_bVolUp) ? SP_VOL_STEP : -SP_VOL_STEP;
+        v = clampf(v, SP_VOL_MIN, SP_VOL_MAX);
+
+        writeTextValue(OBJ_S_VOL, v, 2);
+
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.setVolume = v;
+          xSemaphoreGive(gMutex);
+        }
+      }
+
       else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bSave) {
+        // Pastikan g.* sinkron dengan layar sebelum kirim.
+        // Karena semua setpoint adalah TEXT, kita tarik .txt di sini juga (safety net).
+        float v;
+        String txt;
+
+        if (nexGetTxtBlocking((String(OBJ_S_TSET) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
+          v = clampf(v, SP_TEMP_MIN, SP_TEMP_MAX);
+          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTemp = v; xSemaphoreGive(gMutex); }
+        }
+
+        if (nexGetTxtBlocking((String(OBJ_S_TIME) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
+          int iv = (int)roundf(v);
+          if (iv < SP_TIME_MIN) iv = SP_TIME_MIN;
+          if (iv > SP_TIME_MAX) iv = SP_TIME_MAX;
+          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTimeSec = (uint32_t)iv; xSemaphoreGive(gMutex); }
+        }
+
+        if (nexGetTxtBlocking((String(OBJ_S_WB) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
+          v = clampf(v, SP_BATCH_MIN, SP_BATCH_MAX);
+          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setBatchKg = v; xSemaphoreGive(gMutex); }
+        }
+
+        if (nexGetTxtBlocking((String(OBJ_S_VOL) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
+          v = clampf(v, SP_VOL_MIN, SP_VOL_MAX);
+          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setVolume = v; xSemaphoreGive(gMutex); }
+        }
+
+        // baru kirim settings pakai g yang sudah sinkron
         float setTemp; uint32_t setTime; float setBatch; float setVol;
         int b1, b2;
         if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -578,10 +799,11 @@ static void taskNexRx(void *pv) {
           b2 = g.blowerCoolLvl;
           xSemaphoreGive(gMutex);
         }
+
         enqueueRs(NODE_MEGA_ACT, String("SET_TE:") + String(setTemp, 1));
         enqueueRs(NODE_MEGA_ACT, String("SET_TI:") + String((unsigned)setTime));
         enqueueRs(NODE_MEGA_ACT, String("SET_W:")  + String(setBatch, 2));
-        (void)setVol; // volume placeholder
+        (void)setVol;
         enqueueRs(NODE_MEGA_ACT, String("BLOW:air:") + String(b1));
         enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(b2));
       }
@@ -595,9 +817,13 @@ static void taskNexRx(void *pv) {
           g.blowerCoolLvl = 0;
           xSemaphoreGive(gMutex);
         }
+        // reset juga UI text
+        writeTextValue(OBJ_S_TSET, 1200.0f, 0);
+        writeTextValueInt(OBJ_S_TIME, 30);
+        writeTextValue(OBJ_S_WB, 5.0f, 2);
+        writeTextValue(OBJ_S_VOL, 0.0f, 2);
       }
       else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bBlow1) {
-        // cycle blower air lvl: 0->1->2->0
         if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           g.blowerAirLvl = (g.blowerAirLvl + 1) % 3;
           xSemaphoreGive(gMutex);
@@ -609,15 +835,8 @@ static void taskNexRx(void *pv) {
           xSemaphoreGive(gMutex);
         }
       }
-
-      // numeric widgets (nTempSet/nTimeSet/t2/t1/hManSpeed/hManStep)
-      // Tanpa script, Nextion tidak otomatis push value ke MCU hanya lewat 0x65.
-      // Plug-n-play approach: biarkan user edit, MCU tetap punya state internal.
-      // Nilai tetap dikirim saat SAVE via g.* (yang bisa kamu update lewat cara lain bila mau).
     }
 
-    // Optional: drain bytes lain agar tidak numpuk jika Nextion spam return codes
-    // (tidak wajib, tapi aman)
     if (nexSerial.available() > 128) {
       nexDrainNonTouchReturns(2);
     }
@@ -648,14 +867,9 @@ static void taskPoller(void *pv) {
   const TickType_t dt = pdMS_TO_TICKS(500);
   uint32_t lastSec = 0;
   for (;;) {
-    // request periodic snapshots
     enqueueRs(NODE_TEMP, "REQ_ALL");
     enqueueRs(NODE_WEIGHT, "REQ_ALL");
 
-    // optional: ask MEGA for fuel/status if you implement it
-    // enqueueRs(NODE_MEGA_ACT, "REQ_ALL");
-
-    // update time text (simple uptime)
     uint32_t s = millis() / 1000;
     if (s != lastSec) {
       lastSec = s;
@@ -699,13 +913,25 @@ static void taskUiRender(void *pv) {
     enqueueUiTxt(OBJ_M_TEMP, fmt1(s.tempC));
     enqueueUiTxt(OBJ_M_WEIGHT, fmt2(s.weightKg));
 
-    // SETTINGS snapshot
-    enqueueUiNum(OBJ_S_TSET, (int)roundf(s.setTemp));
-    enqueueUiNum(OBJ_S_TIME, (int)s.setTimeSec);
-    enqueueUiTxt(OBJ_S_WB, String(s.setBatchKg, 1));
-    enqueueUiTxt(OBJ_S_VOL, String(s.setVolume, 1));
+    // SETTINGS snapshot (karena object setpoint adalah TEXT, kita tulis TXT, bukan .val)
+    // Ini hanya mirror dari g.* ke layar. Jika user klik UP/DOWN, g.* sudah di-update.
+    {
+      char b[32];
+      formatFloatNoTrailingZeros(s.setTemp, 0, b, sizeof(b));
+      enqueueUiTxt(OBJ_S_TSET, String(b));
+    }
+    enqueueUiTxt(OBJ_S_TIME, String((unsigned)s.setTimeSec));
+    {
+      char b[32];
+      formatFloatNoTrailingZeros(s.setBatchKg, 2, b, sizeof(b));
+      enqueueUiTxt(OBJ_S_WB, String(b));
+    }
+    {
+      char b[32];
+      formatFloatNoTrailingZeros(s.setVolume, 2, b, sizeof(b));
+      enqueueUiTxt(OBJ_S_VOL, String(b));
+    }
 
-    // blower text (sekadar status)
     auto lvlToTxt = [](int lvl) -> String {
       if (lvl <= 0) return "OFF";
       if (lvl == 1) return "LOW";
@@ -731,6 +957,12 @@ static void hmiBootInit() {
   nexSetTxt(OBJ_D_TW, "0");
   nexSetTxt(OBJ_D_FUEL, "0%");
   nexSetProgress(OBJ_D_HFUEL, 0);
+
+  // init setpoint text sesuai default g
+  writeTextValue(OBJ_S_TSET, g.setTemp, 0);
+  writeTextValueInt(OBJ_S_TIME, (int)g.setTimeSec);
+  writeTextValue(OBJ_S_WB, g.setBatchKg, 2);
+  writeTextValue(OBJ_S_VOL, g.setVolume, 2);
 }
 
 // ======================
@@ -768,7 +1000,7 @@ void setup() {
   // tasks
   xTaskCreatePinnedToCore(taskRsTx,     "rsTx",     4096, nullptr, 3, nullptr, 1);
   xTaskCreatePinnedToCore(taskRsRx,     "rsRx",     4096, nullptr, 3, nullptr, 1);
-  xTaskCreatePinnedToCore(taskNexRx,    "nexRx",    4096, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(taskNexRx,    "nexRx",    6144, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskUiFlush,  "uiFlush",  4096, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(taskPoller,   "poller",   4096, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(taskUiRender, "uiRender", 4096, nullptr, 1, nullptr, 0);
