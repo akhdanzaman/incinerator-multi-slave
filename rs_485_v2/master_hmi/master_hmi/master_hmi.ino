@@ -1,42 +1,16 @@
 /*
- * MCU MASTER (ESP32) - Nextion HMI + RS485 Multi-Slave (FreeRTOS)
- * -----------------------------------------------------------------
- * Goal:
- * - Menjadi master HMI seperti UI pada gambar (Dashboard / Manual / Settings)
- * - Mengirim perintah dan menerima telemetry dari 3 slave via RS485
- * - Protokol RS485 MENYESUAIKAN 3 kode slave kamu:
- *     - Slave mengirim ke master:   Nxx:<payload>\n
- *       ex: N02:TEMP:1234.5
- *           N02:LIMITS:0,1
- *           N02:LIM_HB:0,1
- *           N03:WEIGHT:12.34
- *           N03:LIMITS:1,0
- *     - Master mengirim ke slave:   TOxx:<payload>\n
- *       ex: TO02:REQ_ALL
- *           TO03:REQ_WEIGHT
- *           TO02:REQ_LIMITS
- *           TO03:TARE
+ * MCU MASTER (ESP32) - Nextion HMI (Library) + RS485 Multi-Slave (FreeRTOS)
+ * ------------------------------------------------------------------------
+ * MIGRATION GOALS (from "string driver" -> Nextion library, safer & tested):
+ * - Pakai Nextion library object-based (NexText/NexNumber/NexProgressBar/NexButton/NexDSButton/NexSlider)
+ * - Event input pakai attachPop() (release) seperti HMI lama
+ * - Tidak menambah tombol baru: hanya mapping komponen yang sudah ada di Master baru
+ * - Tetap mempertahankan: FreeRTOS tasks, queue UI/RS485, shared state, poller
  *
- * Catatan penting:
- * - Untuk SLAVE1 (MEGA) yang kamu kirim, kodenya belum menerima command RS485 (hanya USB Serial).
- *   Master ini mengasumsikan MEGA sudah dimodif sederhana untuk menerima frame TO01:<cmd>
- *   dan memanggil handleCommand(<cmd>) seperti handler USB-nya.
- *   Kalau belum, kamu harus tambah RX RS485 di MEGA agar bisa dikendalikan dari master.
- *
- * PERBAIKAN UTAMA (Nextion plug-n-play):
- * - Input Nextion tidak lagi pakai string EVT + newline.
- * - Sekarang pakai event default Nextion: Touch Event 0x65 (65 pp cc ee FF FF FF)
- * - Tidak perlu setting event script apa pun di Nextion.
- * - Kamu cukup isi DEFINE component id & page id sesuai desain HMI kamu.
- *
- * PERBAIKAN SETPOINT TEXT + TOMBOL UP/DOWN:
- * - nTempSet, nTimeSet, t2, t1 adalah OBJECT TEXT (bukan number).
- * - Nilai dibaca dari Nextion saat dibutuhkan via: get <obj>.txt  -> return 0x70 + string + FFF
- * - Tombol up/down untuk tiap setpoint:
- *     - Ambil nilai text (fallback ke g.* jika gagal)
- *     - Tambah/kurang sesuai step
- *     - Tulis balik ke text object (obj.txt="...")
- *     - Update g.* agar SAVE selalu kirim value terbaru
+ * NOTE:
+ * - Kamu HARUS sesuaikan PAGE ID + COMPONENT ID di bawah agar match dengan HMI kamu.
+ * - Nextion library butuh nexLoop(nex_listen_list) dipanggil rutin.
+ *   Di sini dipanggil di taskNexLoop (FreeRTOS), jadi loop() tetap kosong.
  */
 
 #include <Arduino.h>
@@ -44,44 +18,15 @@
 // ======================
 // NEXTION (UART2)
 // ======================
+#include <Nextion.h>
+
 static HardwareSerial &nexSerial = Serial2;
 static const int NEX_RX = 16;
 static const int NEX_TX = 17;
-static const uint32_t NEX_BAUD = 115200;
+static const uint32_t NEX_BAUD = 9600;
 
-// Nextion command terminator
-static inline void nexEnd() {
-  nexSerial.write(0xFF);
-  nexSerial.write(0xFF);
-  nexSerial.write(0xFF);
-}
-
-static void nexCmd(const String &s) {
-  nexSerial.print(s);
-  nexEnd();
-}
-
-static void nexSetTxt(const char *obj, const String &val) {
-  String cmd = String(obj) + ".txt=\"" + val + "\"";
-  nexCmd(cmd);
-}
-
-static void nexSetNum(const char *obj, int v) {
-  String cmd = String(obj) + ".val=" + String(v);
-  nexCmd(cmd);
-}
-
-static void nexSetVis(const char *obj, bool vis) {
-  String cmd = String("vis ") + obj + "," + (vis ? "1" : "0");
-  nexCmd(cmd);
-}
-
-static void nexSetProgress(const char *obj, int pct0_100) {
-  if (pct0_100 < 0) pct0_100 = 0;
-  if (pct0_100 > 100) pct0_100 = 100;
-  String cmd = String(obj) + ".val=" + String(pct0_100);
-  nexCmd(cmd);
-}
+// IMPORTANT: set this to use Serial2
+#define nexSerial Serial2
 
 // ======================
 // RS485 (UART1)
@@ -92,9 +37,7 @@ static const int RS485_TX = 26;
 static const int RS485_DE = 4;
 static const uint32_t RS485_BAUD = 9600;
 
-static inline void rsTxMode(bool en) {
-  digitalWrite(RS485_DE, en ? HIGH : LOW);
-}
+static inline void rsTxMode(bool en) { digitalWrite(RS485_DE, en ? HIGH : LOW); }
 
 static void rsSendLine(const String &line) {
   rsTxMode(true);
@@ -120,24 +63,18 @@ static const uint8_t NODE_WEIGHT   = 3;
 // ======================
 // APP STATE
 // ======================
-enum UiPage : uint8_t { UI_DASH = 0, UI_MANUAL = 1, UI_SETTINGS = 2 };
-
 struct SharedState {
-  // sensors
   float tempC = NAN;
   float weightKg = NAN;
-  uint8_t lim2_a = 0, lim2_b = 0; // dari slave2: LIMITS:x,y
-  uint8_t lim3_a = 0, lim3_b = 0; // dari slave3: LIMITS:x,y
+  uint8_t lim2_a = 0, lim2_b = 0;
+  uint8_t lim3_a = 0, lim3_b = 0;
 
-  // derived/metrics (placeholder, karena belum ada slave volume)
   float totalVolume = 0;
   uint32_t totalBatch = 0;
   float totalWeight = 0;
 
-  // fuel (placeholder, idealnya dari MEGA ACT)
   uint8_t fuelPct = 0;
 
-  // mode
   bool autoRunning = false;
   bool estop = false;
 
@@ -146,10 +83,10 @@ struct SharedState {
   uint32_t setTimeSec = 30;
   float setBatchKg = 5.0f;
   float setVolume = 0;
-  int blowerAirLvl = 0;   // 0=off, 1=low, 2=high
-  int blowerCoolLvl = 0;  // 0=off, 1=low, 2=high
+  int blowerAirLvl = 0;
+  int blowerCoolLvl = 0;
 
-  // manual params
+  // manual
   int manSpeed = 1000;
   int manSteps = 1000;
   bool manDirOpen = true;
@@ -163,11 +100,13 @@ static SemaphoreHandle_t gMutex;
 struct RsTxMsg { uint8_t node; char payload[120]; };
 static QueueHandle_t qRsTx;
 
+// UI update queue (safer to not touch Nex objects from multiple tasks)
+enum UiKind : uint8_t { UI_TXT=0, UI_NUM=1 };
 struct UiUpdate {
-  char obj[24];
+  UiKind kind;
+  uint16_t objId;    // internal id we map to Nex objects
   char txt[64];
-  int  isNum;
-  int  num;
+  int32_t num;
 };
 static QueueHandle_t qUi;
 
@@ -177,8 +116,6 @@ static QueueHandle_t qUi;
 static inline bool isFinite(float x) { return isfinite(x); }
 
 static bool parseFrame(const String &line, uint8_t &idOut, String &payloadOut) {
-  // Expect:
-  //  Nxx:payload
   if (line.length() < 5) return false;
   if (line[0] != 'N') return false;
   char d1 = line[1], d2 = line[2];
@@ -189,77 +126,6 @@ static bool parseFrame(const String &line, uint8_t &idOut, String &payloadOut) {
   return true;
 }
 
-static void enqueueUiTxt(const char *obj, const String &val) {
-  UiUpdate u{};
-  strncpy(u.obj, obj, sizeof(u.obj) - 1);
-  strncpy(u.txt, val.c_str(), sizeof(u.txt) - 1);
-  u.isNum = 0;
-  xQueueSend(qUi, &u, 0);
-}
-
-static void enqueueUiNum(const char *obj, int v) {
-  UiUpdate u{};
-  strncpy(u.obj, obj, sizeof(u.obj) - 1);
-  u.isNum = 1;
-  u.num = v;
-  xQueueSend(qUi, &u, 0);
-}
-
-static void enqueueRs(uint8_t node, const String &payload) {
-  RsTxMsg m{};
-  m.node = node;
-  strncpy(m.payload, payload.c_str(), sizeof(m.payload) - 1);
-  xQueueSend(qRsTx, &m, 0);
-}
-
-// ======================
-// HMI OBJECT NAMES (sesuai label di gambar)
-// ======================
-// DASH
-static const char *OBJ_D_STAT   = "tStat";
-static const char *OBJ_D_TIME   = "tTime";
-static const char *OBJ_D_TEMP   = "tTemp";
-static const char *OBJ_D_WEIGHT = "tWeight";
-static const char *OBJ_D_VOL    = "tVolume";
-static const char *OBJ_D_BATCH  = "tBatch";
-static const char *OBJ_D_TW     = "tTotWeight";
-static const char *OBJ_D_FUEL   = "tFuel";
-static const char *OBJ_D_HFUEL  = "hFuel";   // progress bar
-static const char *OBJ_D_AUTO   = "btAuto";  // start auto
-static const char *OBJ_D_STOP   = "bStop";
-
-// MANUAL
-static const char *OBJ_M_DOOR   = "bManDoor";
-static const char *OBJ_M_BDOOR  = "bManBDoor";
-static const char *OBJ_M_ASH    = "bManAsh";
-static const char *OBJ_M_BURNMV = "bManBum";   // burner mover
-static const char *OBJ_M_CONV   = "bManCon";
-static const char *OBJ_M_PUSH   = "bManPush";
-static const char *OBJ_M_DIR    = "btManDir";
-static const char *OBJ_M_RELAYB = "btManBum";  // relays burner (as per screenshot label overlap)
-static const char *OBJ_M_RELAYI = "btManIgn";
-static const char *OBJ_M_SPD    = "hManSpeed";
-static const char *OBJ_M_STEP   = "hManStep";
-static const char *OBJ_M_TEMP   = "tManTemp";
-static const char *OBJ_M_WEIGHT = "tManWeight";
-static const char *OBJ_M_BLOW_A = "b8";
-static const char *OBJ_M_BLOW_C = "b9";
-static const char *OBJ_M_STOP   = "b5";
-
-// SETTINGS (NOTE: semua ini TEXT object di HMI kamu)
-static const char *OBJ_S_TSET   = "nTempSet"; // TEXT
-static const char *OBJ_S_TIME   = "nTimeSet"; // TEXT
-static const char *OBJ_S_WB     = "t2";       // TEXT (berat/batch)
-static const char *OBJ_S_VOL    = "t1";       // TEXT (volume)
-static const char *OBJ_S_BLOW1T = "tBlow1txt";
-static const char *OBJ_S_BLOW2T = "tBlow2txt";
-static const char *OBJ_S_SAVE   = "bSave";
-static const char *OBJ_S_RESET  = "bReset";
-static const char *OBJ_S_STOP   = "bsettingStop";
-
-// ======================
-// STATUS TEXT HELPERS
-// ======================
 static String stateToText(bool autoRunning, bool estop) {
   if (estop) return "STOP";
   if (autoRunning) return "AUTO";
@@ -280,150 +146,17 @@ static String fmt2(float v) {
   return String(b);
 }
 
-// =====================================================
-// NEXTION INPUT (DEFAULT TOUCH EVENT 0x65) - PLUG N PLAY
-// =====================================================
-// Nextion default touch event (return code):
-//   0x65  pageId  compId  event  0xFF 0xFF 0xFF
-// event: biasanya 0x00 = release, 0x01 = press
-//
-// Kamu cukup set page id & component id (di Nextion editor sudah ada fieldnya).
-// Tidak perlu script event sama sekali.
-
-// ---- isi sendiri sesuai HMI kamu ----
-// PAGE IDs
-#define NEX_PAGE_DASH      0   // <- isi
-#define NEX_PAGE_MANUAL    1   // <- isi
-#define NEX_PAGE_SETTINGS  2   // <- isi
-
-// DASH component IDs
-#define NEX_CID_btAuto       0   // <- isi
-#define NEX_CID_bStop        0   // <- isi
-
-// MANUAL component IDs
-#define NEX_CID_bManDoor     0   // <- isi
-#define NEX_CID_bManBDoor    0   // <- isi
-#define NEX_CID_bManPush     0   // <- isi
-#define NEX_CID_bManCon      0   // <- isi
-#define NEX_CID_btManIgn     0   // <- isi
-#define NEX_CID_btManBum     0   // <- isi
-#define NEX_CID_hManSpeed    0   // <- isi
-#define NEX_CID_hManStep     0   // <- isi
-#define NEX_CID_b5Stop       0   // <- isi
-
-// SETTINGS component IDs
-#define NEX_CID_bSave         0   // <- isi
-#define NEX_CID_bReset        0   // <- isi
-#define NEX_CID_bsettingStop  0   // <- isi
-
-// Setpoint buttons (UP/DOWN) (sesuai screenshot kamu)
-#define NEX_CID_bTempUp       0   // <- isi (bTempUp)
-#define NEX_CID_bTempDn       0   // <- isi (bTempD)
-#define NEX_CID_bTimeUp       0   // <- isi (bTimeUp)
-#define NEX_CID_bTimeDn       0   // <- isi (bTimeD)
-#define NEX_CID_bBatchUp      0   // <- isi (b2)
-#define NEX_CID_bBatchDn      0   // <- isi (b4)
-#define NEX_CID_bVolUp        0   // <- isi (b1)
-#define NEX_CID_bVolDn        0   // <- isi (b0)
-
-// Blower buttons
-#define NEX_CID_bBlow1        0   // <- isi (bBlow1)
-#define NEX_CID_bBlow2        0   // <- isi (bBlow2)
-
-// -----------------------------------------------------
-// Default touch frame reader (robust sync)
-// -----------------------------------------------------
-static bool nexReadTouch(uint8_t &page, uint8_t &comp, uint8_t &evt) {
-  // Frame: 65 pp cc ee FF FF FF
-  static uint8_t buf[7];
-  static uint8_t idx = 0;
-
-  while (nexSerial.available()) {
-    uint8_t b = (uint8_t)nexSerial.read();
-
-    // sync to 0x65
-    if (idx == 0) {
-      if (b != 0x65) continue;
-      buf[idx++] = b;
-      continue;
-    }
-
-    buf[idx++] = b;
-
-    if (idx == 7) {
-      idx = 0;
-      if (buf[0] == 0x65 && buf[4] == 0xFF && buf[5] == 0xFF && buf[6] == 0xFF) {
-        page = buf[1];
-        comp = buf[2];
-        evt  = buf[3];
-        return true;
-      }
-      // if invalid, continue scanning
-    }
-  }
-
-  return false;
-}
-
-static void nexDrainNonTouchReturns(unsigned long maxMs) {
-  unsigned long t0 = millis();
-  while (nexSerial.available() && (millis() - t0) < maxMs) {
-    (void)nexSerial.read();
-  }
-}
-
-// =====================================================
-// NEXTION GET TEXT (0x70) helpers (untuk object TEXT)
-// =====================================================
-static bool nexGetTxtBlocking(const char* objDotTxt, String &out, uint32_t timeoutMs = 140) {
-  // bersihin input biar gak ketuker return lama
-  while (nexSerial.available()) (void)nexSerial.read();
-
-  // kirim query
-  String cmd = String("get ") + objDotTxt; // ex: get nTempSet.txt
-  nexCmd(cmd);
-
-  // tunggu return 0x70 + <string bytes> + FFF
-  out = "";
-  unsigned long t0 = millis();
-  bool started = false;
-
-  while ((millis() - t0) < timeoutMs) {
-    while (nexSerial.available()) {
-      uint8_t b = (uint8_t)nexSerial.read();
-
-      if (!started) {
-        if (b != 0x70) continue;
-        started = true;
-        continue;
-      }
-
-      // after start: capture until FFF
-      // We detect FFF by checking last 3 bytes after appending.
-      out += (char)b;
-
-      int n = out.length();
-      if (n >= 3) {
-        if ((uint8_t)out[n-1] == 0xFF && (uint8_t)out[n-2] == 0xFF && (uint8_t)out[n-3] == 0xFF) {
-          out.remove(n-3); // drop terminator
-          out.trim();
-          return true;
-        }
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-
-  return false;
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
 }
 
 static bool parseFloatLoose(const String &sIn, float &out) {
   String s = sIn;
   s.trim();
   if (!s.length()) return false;
-  // allow commas as decimal separators, and remove non-numeric junk
   s.replace(",", ".");
-  // Keep only digits, sign, dot
   String t; t.reserve(s.length());
   for (int i=0;i<(int)s.length();i++) {
     char c = s[i];
@@ -434,20 +167,12 @@ static bool parseFloatLoose(const String &sIn, float &out) {
   return isfinite(out);
 }
 
-static float clampf(float v, float lo, float hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
 static void formatFloatNoTrailingZeros(float v, uint8_t decimals, char *out, size_t outSz) {
-  // decimals: 0..3 typical
   char fmt[8];
   snprintf(fmt, sizeof(fmt), "%%.%uf", (unsigned)decimals);
   char buf[32];
   snprintf(buf, sizeof(buf), fmt, (double)v);
 
-  // trim trailing zeros + dot
   String s(buf);
   if (decimals > 0) {
     while (s.endsWith("0")) s.remove(s.length()-1);
@@ -457,9 +182,9 @@ static void formatFloatNoTrailingZeros(float v, uint8_t decimals, char *out, siz
   out[outSz-1] = 0;
 }
 
-// ============================================
-// SETPOINT RULES (step + clamp)
-// ============================================
+// ======================
+// SETPOINT RULES
+// ======================
 static const float SP_TEMP_STEP  = 10.0f;
 static const float SP_TEMP_MIN   = 0.0f;
 static const float SP_TEMP_MAX   = 2000.0f;
@@ -476,24 +201,181 @@ static const int   SP_TIME_STEP  = 1;
 static const int   SP_TIME_MIN   = 1;
 static const int   SP_TIME_MAX   = 86400;
 
-// Helper: read a TEXT object as float, fallback to provided fallbackVal if fail.
-static float readTextAsFloatOrFallback(const char *objName, float fallbackVal) {
+// ======================
+// NEXTION: PAGE/COMP IDs
+// ======================
+// Kamu WAJIB sesuaikan ini dengan Nextion editor (page, id).
+// NOTE: Nextion lib pakai (pageId, componentId, "name") saat deklarasi.
+
+// Pages
+static const uint8_t PAGE_DASH     = 0;
+static const uint8_t PAGE_MANUAL   = 1;
+static const uint8_t PAGE_SETTINGS = 2;
+
+// ----------------------
+// DASH objects
+// ----------------------
+NexText tStat      = NexText(PAGE_DASH,     1,  "tStat");
+NexText tTime      = NexText(PAGE_DASH,     2,  "tTime");
+NexText tTemp      = NexText(PAGE_DASH,     3,  "tTemp");
+NexText tWeight    = NexText(PAGE_DASH,     4,  "tWeight");
+NexText tVolume    = NexText(PAGE_DASH,     5,  "tVolume");
+NexText tBatch     = NexText(PAGE_DASH,     6,  "tBatch");
+NexText tTotWeight = NexText(PAGE_DASH,     7,  "tTotWeight");
+NexText tFuel      = NexText(PAGE_DASH,     8,  "tFuel");
+NexProgressBar hFuel = NexProgressBar(PAGE_DASH, 9,  "hFuel");
+
+NexButton btAuto   = NexButton(PAGE_DASH,   10, "btAuto");
+NexButton bStop    = NexButton(PAGE_DASH,   11, "bStop");
+
+// ----------------------
+// MANUAL objects
+// ----------------------
+NexButton bManDoor  = NexButton(PAGE_MANUAL, 1,  "bManDoor");
+NexButton bManBDoor = NexButton(PAGE_MANUAL, 2,  "bManBDoor");
+NexButton bManCon   = NexButton(PAGE_MANUAL, 3,  "bManCon");
+NexButton bManPush  = NexButton(PAGE_MANUAL, 4,  "bManPush");
+
+NexDSButton btManDir  = NexDSButton(PAGE_MANUAL, 5, "btManDir");
+NexDSButton btManIgn  = NexDSButton(PAGE_MANUAL, 6, "btManIgn");
+NexDSButton btManBurn = NexDSButton(PAGE_MANUAL, 7, "btManBurn");
+
+// Sliders (kalau memang di HMI kamu slider; kalau sebenarnya "hManSpeed" adalah slider)
+NexSlider hManSpeed = NexSlider(PAGE_MANUAL, 8, "hManSpeed");
+NexSlider hManStep  = NexSlider(PAGE_MANUAL, 9, "hManStep");
+
+NexText tManTemp    = NexText(PAGE_MANUAL, 10, "tManTemp");
+NexText tManWeight  = NexText(PAGE_MANUAL, 11, "tManWeight");
+
+NexButton b5StopManual = NexButton(PAGE_MANUAL, 12, "b5");
+
+// ----------------------
+// SETTINGS objects
+// NOTE: kamu bilang ini TEXT, jadi pakai NexText
+// ----------------------
+NexText nTempSet = NexText(PAGE_SETTINGS, 1, "nTempSet");
+NexText nTimeSet = NexText(PAGE_SETTINGS, 2, "nTimeSet");
+NexText t2Batch  = NexText(PAGE_SETTINGS, 3, "t2");
+NexText t1Vol    = NexText(PAGE_SETTINGS, 4, "t1");
+
+NexText tBlow1txt = NexText(PAGE_SETTINGS, 5, "tBlow1txt");
+NexText tBlow2txt = NexText(PAGE_SETTINGS, 6, "tBlow2txt");
+
+NexButton bSave        = NexButton(PAGE_SETTINGS, 7, "bSave");
+NexButton bReset       = NexButton(PAGE_SETTINGS, 8, "bReset");
+NexButton bsettingStop = NexButton(PAGE_SETTINGS, 9, "bsettingStop");
+
+// UP/DOWN buttons for setpoints
+NexButton bTempUp  = NexButton(PAGE_SETTINGS, 10, "bTempUp");
+NexButton bTempDn  = NexButton(PAGE_SETTINGS, 11, "bTempD");
+NexButton bTimeUp  = NexButton(PAGE_SETTINGS, 12, "bTimeUp");
+NexButton bTimeDn  = NexButton(PAGE_SETTINGS, 13, "bTimeD");
+NexButton bBatchUp = NexButton(PAGE_SETTINGS, 14, "b2");
+NexButton bBatchDn = NexButton(PAGE_SETTINGS, 15, "b4");
+NexButton bVolUp   = NexButton(PAGE_SETTINGS, 16, "b1");
+NexButton bVolDn   = NexButton(PAGE_SETTINGS, 17, "b0");
+
+NexButton bBlow1   = NexButton(PAGE_SETTINGS, 18, "bBlow1");
+NexButton bBlow2   = NexButton(PAGE_SETTINGS, 19, "bBlow2");
+
+// Listener list (Nextion library requirement)
+NexTouch *nex_listen_list[] = {
+  &btAuto, &bStop,
+  &bManDoor, &bManBDoor, &bManCon, &bManPush,
+  &btManDir, &btManIgn, &btManBurn,
+  &hManSpeed, &hManStep,
+  &b5StopManual,
+  &bSave, &bReset, &bsettingStop,
+  &bTempUp, &bTempDn, &bTimeUp, &bTimeDn,
+  &bBatchUp, &bBatchDn, &bVolUp, &bVolDn,
+  &bBlow1, &bBlow2,
+  NULL
+};
+
+// ======================
+// UI OBJ ID MAP (for UI queue)
+// ======================
+enum UiObjId : uint16_t {
+  UI_TSTAT=1, UI_TTIME, UI_TTEMP, UI_TWEIGHT,
+  UI_TVOL, UI_TBATCH, UI_TTOTW, UI_TFUEL,
+  UI_HFUEL,
+
+  UI_TMAN_TEMP, UI_TMAN_WEIGHT,
+  UI_DSB_DIR,
+
+  UI_ST_TSET, UI_ST_TIME, UI_ST_BATCH, UI_ST_VOL,
+  UI_ST_BLOW1, UI_ST_BLOW2
+};
+
+static void uiEnqTxt(UiObjId id, const String &s) {
+  UiUpdate u{};
+  u.kind = UI_TXT;
+  u.objId = (uint16_t)id;
+  strncpy(u.txt, s.c_str(), sizeof(u.txt)-1);
+  xQueueSend(qUi, &u, 0);
+}
+
+static void uiEnqNum(UiObjId id, int32_t v) {
+  UiUpdate u{};
+  u.kind = UI_NUM;
+  u.objId = (uint16_t)id;
+  u.num = v;
+  xQueueSend(qUi, &u, 0);
+}
+
+static void enqueueRs(uint8_t node, const String &payload) {
+  RsTxMsg m{};
+  m.node = node;
+  strncpy(m.payload, payload.c_str(), sizeof(m.payload)-1);
+  xQueueSend(qRsTx, &m, 0);
+}
+
+// ======================
+// NEXTION SAFE SETTERS (centralized)
+// ======================
+static void nxSetText(NexText &obj, const String &s) {
+  obj.setText(s.c_str());
+}
+
+static void nxSetProgress(NexProgressBar &obj, int v0_100) {
+  if (v0_100 < 0) v0_100 = 0;
+  if (v0_100 > 100) v0_100 = 100;
+  obj.setValue((uint32_t)v0_100);
+}
+
+static void nxSetDs(NexDSButton &obj, bool on) {
+  obj.setValue(on ? 1 : 0);
+}
+
+// Reading TEXT using library call (safer than manual 0x70 parsing)
+static bool nxGetText(NexText &obj, String &out) {
+  char buf[64] = {0};
+  uint16_t len = sizeof(buf);
+  if (obj.getText(buf, len)) {
+    out = String(buf);
+    out.trim();
+    return true;
+  }
+  return false;
+}
+
+static float readTextAsFloatOrFallback(NexText &obj, float fallbackVal) {
   String txt;
-  if (nexGetTxtBlocking((String(objName) + ".txt").c_str(), txt)) {
+  if (nxGetText(obj, txt)) {
     float v;
     if (parseFloatLoose(txt, v)) return v;
   }
   return fallbackVal;
 }
 
-static void writeTextValue(const char *objName, float v, uint8_t decimals) {
+static void writeTextValue(NexText &obj, float v, uint8_t decimals) {
   char b[32];
   formatFloatNoTrailingZeros(v, decimals, b, sizeof(b));
-  nexSetTxt(objName, String(b));
+  nxSetText(obj, String(b));
 }
 
-static void writeTextValueInt(const char *objName, int v) {
-  nexSetTxt(objName, String(v));
+static void writeTextValueInt(NexText &obj, int v) {
+  nxSetText(obj, String(v));
 }
 
 // ======================
@@ -522,51 +404,33 @@ static void taskRsRx(void *pv) {
       if (c == '\n') {
         buf.trim();
         if (buf.length()) {
-          uint8_t id;
-          String payload;
+          uint8_t id; String payload;
           if (parseFrame(buf, id, payload)) {
-            // Update shared state
             if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
               if (id == NODE_TEMP) {
                 if (payload.startsWith("TEMP:")) {
                   String v = payload.substring(5);
                   if (v == "OPEN" || v == "NaN") g.tempC = NAN;
-                  else {
-                    float t = v.toFloat();
-                    g.tempC = isfinite(t) ? t : NAN;
-                  }
-                } else if (payload.startsWith("LIMITS:")) {
+                  else { float t = v.toFloat(); g.tempC = isfinite(t) ? t : NAN; }
+                } else if (payload.startsWith("LIMITS:") || payload.startsWith("LIM_HB:")) {
+                  int p = payload.indexOf(':');
                   int c1 = payload.indexOf(',');
-                  if (c1 > 7) {
-                    g.lim2_a = (uint8_t)payload.substring(7, c1).toInt();
-                    g.lim2_b = (uint8_t)payload.substring(c1 + 1).toInt();
-                  }
-                } else if (payload.startsWith("LIM_HB:")) {
-                  int c1 = payload.indexOf(',');
-                  if (c1 > 7) {
-                    g.lim2_a = (uint8_t)payload.substring(7, c1).toInt();
-                    g.lim2_b = (uint8_t)payload.substring(c1 + 1).toInt();
+                  if (p >= 0 && c1 > p+1) {
+                    g.lim2_a = (uint8_t)payload.substring(p+1, c1).toInt();
+                    g.lim2_b = (uint8_t)payload.substring(c1+1).toInt();
                   }
                 }
               } else if (id == NODE_WEIGHT) {
                 if (payload.startsWith("WEIGHT:")) {
                   String v = payload.substring(7);
                   if (v == "NaN") g.weightKg = NAN;
-                  else {
-                    float w = v.toFloat();
-                    g.weightKg = isfinite(w) ? w : NAN;
-                  }
-                } else if (payload.startsWith("LIMITS:")) {
+                  else { float w = v.toFloat(); g.weightKg = isfinite(w) ? w : NAN; }
+                } else if (payload.startsWith("LIMITS:") || payload.startsWith("LIM_HB:")) {
+                  int p = payload.indexOf(':');
                   int c1 = payload.indexOf(',');
-                  if (c1 > 7) {
-                    g.lim3_a = (uint8_t)payload.substring(7, c1).toInt();
-                    g.lim3_b = (uint8_t)payload.substring(c1 + 1).toInt();
-                  }
-                } else if (payload.startsWith("LIM_HB:")) {
-                  int c1 = payload.indexOf(',');
-                  if (c1 > 7) {
-                    g.lim3_a = (uint8_t)payload.substring(7, c1).toInt();
-                    g.lim3_b = (uint8_t)payload.substring(c1 + 1).toInt();
+                  if (p >= 0 && c1 > p+1) {
+                    g.lim3_a = (uint8_t)payload.substring(p+1, c1).toInt();
+                    g.lim3_b = (uint8_t)payload.substring(c1+1).toInt();
                   }
                 }
               } else if (id == NODE_MEGA_ACT) {
@@ -593,275 +457,351 @@ static void taskRsRx(void *pv) {
 }
 
 // ======================
-// TASK: NEXTION RX (DEFAULT TOUCH)
+// NEXTION EVENT CALLBACKS (HMI lama style)
 // ======================
-static void taskNexRx(void *pv) {
+
+// DASH
+static void cb_btAuto(void *ptr) {
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.estop = false;
+    g.autoRunning = true;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, "CMD_RUN_AUTO");
+}
+
+static void cb_bStop(void *ptr) {
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.estop = true;
+    g.autoRunning = false;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
+}
+
+// MANUAL
+static void cb_btManDir(void *ptr) {
+  bool dirOpen = true;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.manDirOpen = !g.manDirOpen;
+    dirOpen = g.manDirOpen;
+    xSemaphoreGive(gMutex);
+  }
+  uiEnqNum(UI_DSB_DIR, dirOpen ? 1 : 0);
+  enqueueRs(NODE_MEGA_ACT, String("MAN_DIR:") + (dirOpen ? "OPEN" : "CLOSE"));
+}
+
+static void cb_b5StopManual(void *ptr) {
+  cb_bStop(ptr);
+}
+
+static void cb_bManDoor(void *ptr) {
+  bool dirOpen = true;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    dirOpen = g.manDirOpen;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, dirOpen ? "MAINDOOR_OPEN" : "MAINDOOR_CLOSE");
+}
+
+static void cb_bManBDoor(void *ptr) {
+  bool dirOpen = true;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    dirOpen = g.manDirOpen;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, dirOpen ? "BDOOR_OPEN" : "BDOOR_CLOSE");
+}
+
+static void cb_bManPush(void *ptr) {
+  bool dirOpen = true;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    dirOpen = g.manDirOpen;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, dirOpen ? "PUSHER_MAJU" : "PUSHER_MUNDUR");
+}
+
+static void cb_bManCon(void *ptr) {
+  static uint8_t convMode = 0; // 0 stop, 1 fwd, 2 rev
+  convMode = (uint8_t)((convMode + 1) % 3);
+  if (convMode == 0) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_STOP");
+  else if (convMode == 1) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_FWD");
+  else enqueueRs(NODE_MEGA_ACT, "CONVEYOR_REV");
+}
+
+static void cb_btManIgn(void *ptr) {
+  uint32_t v=0;
+  btManIgn.getValue(&v);
+  enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_IGN:") + String((int)v));
+}
+
+static void cb_btManBurn(void *ptr) {
+  uint32_t v=0;
+  btManBurn.getValue(&v);
+  enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_BURN:") + String((int)v));
+}
+
+static void cb_hManSpeed(void *ptr) {
+  uint32_t v=0;
+  hManSpeed.getValue(&v);
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.manSpeed = (int)v;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, String("MAN_SPEED:") + String((unsigned)v));
+}
+
+static void cb_hManStep(void *ptr) {
+  uint32_t v=0;
+  hManStep.getValue(&v);
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.manSteps = (int)v;
+    xSemaphoreGive(gMutex);
+  }
+  enqueueRs(NODE_MEGA_ACT, String("MAN_STEPS:") + String((unsigned)v));
+}
+
+// SETTINGS
+static void cb_bsettingStop(void *ptr) {
+  cb_bStop(ptr);
+}
+
+static void cb_bTempUp(void *ptr) {
+  float cur = 1200.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTemp; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(nTempSet, cur);
+  v = clampf(v + SP_TEMP_STEP, SP_TEMP_MIN, SP_TEMP_MAX);
+  writeTextValue(nTempSet, v, 0);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTemp = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bTempDn(void *ptr) {
+  float cur = 1200.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTemp; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(nTempSet, cur);
+  v = clampf(v - SP_TEMP_STEP, SP_TEMP_MIN, SP_TEMP_MAX);
+  writeTextValue(nTempSet, v, 0);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTemp = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bTimeUp(void *ptr) {
+  uint32_t cur = 30;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTimeSec; xSemaphoreGive(gMutex); }
+
+  float f = readTextAsFloatOrFallback(nTimeSet, (float)cur);
+  int v = (int)roundf(f);
+  v += SP_TIME_STEP;
+  if (v < SP_TIME_MIN) v = SP_TIME_MIN;
+  if (v > SP_TIME_MAX) v = SP_TIME_MAX;
+
+  writeTextValueInt(nTimeSet, v);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTimeSec = (uint32_t)v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bTimeDn(void *ptr) {
+  uint32_t cur = 30;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTimeSec; xSemaphoreGive(gMutex); }
+
+  float f = readTextAsFloatOrFallback(nTimeSet, (float)cur);
+  int v = (int)roundf(f);
+  v -= SP_TIME_STEP;
+  if (v < SP_TIME_MIN) v = SP_TIME_MIN;
+  if (v > SP_TIME_MAX) v = SP_TIME_MAX;
+
+  writeTextValueInt(nTimeSet, v);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTimeSec = (uint32_t)v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bBatchUp(void *ptr) {
+  float cur = 5.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setBatchKg; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(t2Batch, cur);
+  v = clampf(v + SP_BATCH_STEP, SP_BATCH_MIN, SP_BATCH_MAX);
+  writeTextValue(t2Batch, v, 2);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setBatchKg = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bBatchDn(void *ptr) {
+  float cur = 5.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setBatchKg; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(t2Batch, cur);
+  v = clampf(v - SP_BATCH_STEP, SP_BATCH_MIN, SP_BATCH_MAX);
+  writeTextValue(t2Batch, v, 2);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setBatchKg = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bVolUp(void *ptr) {
+  float cur = 0.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setVolume; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(t1Vol, cur);
+  v = clampf(v + SP_VOL_STEP, SP_VOL_MIN, SP_VOL_MAX);
+  writeTextValue(t1Vol, v, 2);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setVolume = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bVolDn(void *ptr) {
+  float cur = 0.0f;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setVolume; xSemaphoreGive(gMutex); }
+
+  float v = readTextAsFloatOrFallback(t1Vol, cur);
+  v = clampf(v - SP_VOL_STEP, SP_VOL_MIN, SP_VOL_MAX);
+  writeTextValue(t1Vol, v, 2);
+
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setVolume = v; xSemaphoreGive(gMutex); }
+}
+
+static void cb_bBlow1(void *ptr) {
+  int lvl;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.blowerAirLvl = (g.blowerAirLvl + 1) % 3;
+    lvl = g.blowerAirLvl;
+    xSemaphoreGive(gMutex);
+  } else lvl = 0;
+
+  // UI text will be refreshed by renderer
+  enqueueRs(NODE_MEGA_ACT, String("BLOW:air:") + String(lvl));
+}
+
+static void cb_bBlow2(void *ptr) {
+  int lvl;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.blowerCoolLvl = (g.blowerCoolLvl + 1) % 3;
+    lvl = g.blowerCoolLvl;
+    xSemaphoreGive(gMutex);
+  } else lvl = 0;
+
+  enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(lvl));
+}
+
+static void cb_bSave(void *ptr) {
+  // safety net: pull from screen text before send
+  float fv;
+  String txt;
+
+  if (nxGetText(nTempSet, txt) && parseFloatLoose(txt, fv)) {
+    fv = clampf(fv, SP_TEMP_MIN, SP_TEMP_MAX);
+    if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTemp = fv; xSemaphoreGive(gMutex); }
+  }
+
+  if (nxGetText(nTimeSet, txt) && parseFloatLoose(txt, fv)) {
+    int iv = (int)roundf(fv);
+    if (iv < SP_TIME_MIN) iv = SP_TIME_MIN;
+    if (iv > SP_TIME_MAX) iv = SP_TIME_MAX;
+    if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTimeSec = (uint32_t)iv; xSemaphoreGive(gMutex); }
+  }
+
+  if (nxGetText(t2Batch, txt) && parseFloatLoose(txt, fv)) {
+    fv = clampf(fv, SP_BATCH_MIN, SP_BATCH_MAX);
+    if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setBatchKg = fv; xSemaphoreGive(gMutex); }
+  }
+
+  if (nxGetText(t1Vol, txt) && parseFloatLoose(txt, fv)) {
+    fv = clampf(fv, SP_VOL_MIN, SP_VOL_MAX);
+    if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setVolume = fv; xSemaphoreGive(gMutex); }
+  }
+
+  float setTemp; uint32_t setTime; float setBatch; float setVol;
+  int b1, b2;
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    setTemp = g.setTemp;
+    setTime = g.setTimeSec;
+    setBatch = g.setBatchKg;
+    setVol = g.setVolume;
+    b1 = g.blowerAirLvl;
+    b2 = g.blowerCoolLvl;
+    xSemaphoreGive(gMutex);
+  }
+
+  enqueueRs(NODE_MEGA_ACT, String("SET_TE:") + String(setTemp, 1));
+  enqueueRs(NODE_MEGA_ACT, String("SET_TI:") + String((unsigned)setTime));
+  enqueueRs(NODE_MEGA_ACT, String("SET_W:")  + String(setBatch, 2));
+  (void)setVol;
+  enqueueRs(NODE_MEGA_ACT, String("BLOW:air:")  + String(b1));
+  enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(b2));
+}
+
+static void cb_bReset(void *ptr) {
+  if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g.setTemp = 1200.0f;
+    g.setTimeSec = 30;
+    g.setBatchKg = 5.0f;
+    g.setVolume = 0;
+    g.blowerAirLvl = 0;
+    g.blowerCoolLvl = 0;
+    xSemaphoreGive(gMutex);
+  }
+
+  writeTextValue(nTempSet, 1200.0f, 0);
+  writeTextValueInt(nTimeSet, 30);
+  writeTextValue(t2Batch, 5.0f, 2);
+  writeTextValue(t1Vol, 0.0f, 2);
+}
+
+// ======================
+// TASK: NEXTION LOOP (runs nexLoop safely)
+// ======================
+static void taskNexLoop(void *pv) {
   for (;;) {
-    uint8_t page = 0, comp = 0, evt = 0;
-
-    while (nexReadTouch(page, comp, evt)) {
-      const bool isRelease = (evt == 0x00);
-      if (!isRelease) continue;
-
-      // DASH
-      if (page == NEX_PAGE_DASH && comp == NEX_CID_bStop) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.estop = true;
-          g.autoRunning = false;
-          xSemaphoreGive(gMutex);
-        }
-        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
-      }
-      else if (page == NEX_PAGE_DASH && comp == NEX_CID_btAuto) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.estop = false;
-          g.autoRunning = true;
-          xSemaphoreGive(gMutex);
-        }
-        enqueueRs(NODE_MEGA_ACT, "CMD_RUN_AUTO");
-      }
-
-      // MANUAL
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_b5Stop) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.estop = true;
-          g.autoRunning = false;
-          xSemaphoreGive(gMutex);
-        }
-        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManDoor) {
-        bool open;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.manDirOpen = !g.manDirOpen;
-          open = g.manDirOpen;
-          xSemaphoreGive(gMutex);
-        } else {
-          open = true;
-        }
-        enqueueRs(NODE_MEGA_ACT, open ? "MAINDOOR_OPEN" : "MAINDOOR_CLOSE");
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManBDoor) {
-        bool open;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.manDirOpen = !g.manDirOpen;
-          open = g.manDirOpen;
-          xSemaphoreGive(gMutex);
-        } else {
-          open = true;
-        }
-        enqueueRs(NODE_MEGA_ACT, open ? "BDOOR_OPEN" : "BDOOR_CLOSE");
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManPush) {
-        bool maju;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.manDirOpen = !g.manDirOpen;
-          maju = g.manDirOpen;
-          xSemaphoreGive(gMutex);
-        } else {
-          maju = true;
-        }
-        enqueueRs(NODE_MEGA_ACT, maju ? "PUSHER_MAJU" : "PUSHER_MUNDUR");
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManCon) {
-        static uint8_t convMode = 0; // 0 stop, 1 fwd, 2 rev
-        convMode = (uint8_t)((convMode + 1) % 3);
-        if (convMode == 0) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_STOP");
-        else if (convMode == 1) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_FWD");
-        else enqueueRs(NODE_MEGA_ACT, "CONVEYOR_REV");
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_btManIgn) {
-        static uint8_t ign = 0;
-        ign ^= 1;
-        enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_IGN:") + String((int)ign));
-      }
-      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_btManBum) {
-        static uint8_t burn = 0;
-        burn ^= 1;
-        enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_BURN:") + String((int)burn));
-      }
-
-      // SETTINGS
-      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bsettingStop) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.estop = true;
-          g.autoRunning = false;
-          xSemaphoreGive(gMutex);
-        }
-        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
-      }
-
-      // --- UP/DOWN Setpoints (TEXT objects) ---
-      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bTempUp || comp == NEX_CID_bTempDn)) {
-        float cur;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTemp; xSemaphoreGive(gMutex); }
-        else cur = 1200.0f;
-
-        float v = readTextAsFloatOrFallback(OBJ_S_TSET, cur);
-        v += (comp == NEX_CID_bTempUp) ? SP_TEMP_STEP : -SP_TEMP_STEP;
-        v = clampf(v, SP_TEMP_MIN, SP_TEMP_MAX);
-
-        writeTextValue(OBJ_S_TSET, v, 0);
-
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.setTemp = v;
-          xSemaphoreGive(gMutex);
-        }
-      }
-      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bTimeUp || comp == NEX_CID_bTimeDn)) {
-        uint32_t cur;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setTimeSec; xSemaphoreGive(gMutex); }
-        else cur = 30;
-
-        float f = readTextAsFloatOrFallback(OBJ_S_TIME, (float)cur);
-        int v = (int)roundf(f);
-        v += (comp == NEX_CID_bTimeUp) ? SP_TIME_STEP : -SP_TIME_STEP;
-        if (v < SP_TIME_MIN) v = SP_TIME_MIN;
-        if (v > SP_TIME_MAX) v = SP_TIME_MAX;
-
-        writeTextValueInt(OBJ_S_TIME, v);
-
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.setTimeSec = (uint32_t)v;
-          xSemaphoreGive(gMutex);
-        }
-      }
-      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bBatchUp || comp == NEX_CID_bBatchDn)) {
-        float cur;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setBatchKg; xSemaphoreGive(gMutex); }
-        else cur = 5.0f;
-
-        float v = readTextAsFloatOrFallback(OBJ_S_WB, cur);
-        v += (comp == NEX_CID_bBatchUp) ? SP_BATCH_STEP : -SP_BATCH_STEP;
-        v = clampf(v, SP_BATCH_MIN, SP_BATCH_MAX);
-
-        writeTextValue(OBJ_S_WB, v, 2);
-
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.setBatchKg = v;
-          xSemaphoreGive(gMutex);
-        }
-      }
-      else if (page == NEX_PAGE_SETTINGS && (comp == NEX_CID_bVolUp || comp == NEX_CID_bVolDn)) {
-        float cur;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { cur = g.setVolume; xSemaphoreGive(gMutex); }
-        else cur = 0.0f;
-
-        float v = readTextAsFloatOrFallback(OBJ_S_VOL, cur);
-        v += (comp == NEX_CID_bVolUp) ? SP_VOL_STEP : -SP_VOL_STEP;
-        v = clampf(v, SP_VOL_MIN, SP_VOL_MAX);
-
-        writeTextValue(OBJ_S_VOL, v, 2);
-
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.setVolume = v;
-          xSemaphoreGive(gMutex);
-        }
-      }
-
-      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bSave) {
-        // Pastikan g.* sinkron dengan layar sebelum kirim.
-        // Karena semua setpoint adalah TEXT, kita tarik .txt di sini juga (safety net).
-        float v;
-        String txt;
-
-        if (nexGetTxtBlocking((String(OBJ_S_TSET) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
-          v = clampf(v, SP_TEMP_MIN, SP_TEMP_MAX);
-          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTemp = v; xSemaphoreGive(gMutex); }
-        }
-
-        if (nexGetTxtBlocking((String(OBJ_S_TIME) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
-          int iv = (int)roundf(v);
-          if (iv < SP_TIME_MIN) iv = SP_TIME_MIN;
-          if (iv > SP_TIME_MAX) iv = SP_TIME_MAX;
-          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setTimeSec = (uint32_t)iv; xSemaphoreGive(gMutex); }
-        }
-
-        if (nexGetTxtBlocking((String(OBJ_S_WB) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
-          v = clampf(v, SP_BATCH_MIN, SP_BATCH_MAX);
-          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setBatchKg = v; xSemaphoreGive(gMutex); }
-        }
-
-        if (nexGetTxtBlocking((String(OBJ_S_VOL) + ".txt").c_str(), txt) && parseFloatLoose(txt, v)) {
-          v = clampf(v, SP_VOL_MIN, SP_VOL_MAX);
-          if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) { g.setVolume = v; xSemaphoreGive(gMutex); }
-        }
-
-        // baru kirim settings pakai g yang sudah sinkron
-        float setTemp; uint32_t setTime; float setBatch; float setVol;
-        int b1, b2;
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          setTemp = g.setTemp;
-          setTime = g.setTimeSec;
-          setBatch = g.setBatchKg;
-          setVol = g.setVolume;
-          b1 = g.blowerAirLvl;
-          b2 = g.blowerCoolLvl;
-          xSemaphoreGive(gMutex);
-        }
-
-        enqueueRs(NODE_MEGA_ACT, String("SET_TE:") + String(setTemp, 1));
-        enqueueRs(NODE_MEGA_ACT, String("SET_TI:") + String((unsigned)setTime));
-        enqueueRs(NODE_MEGA_ACT, String("SET_W:")  + String(setBatch, 2));
-        (void)setVol;
-        enqueueRs(NODE_MEGA_ACT, String("BLOW:air:") + String(b1));
-        enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(b2));
-      }
-      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bReset) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.setTemp = 1200.0f;
-          g.setTimeSec = 30;
-          g.setBatchKg = 5.0f;
-          g.setVolume = 0;
-          g.blowerAirLvl = 0;
-          g.blowerCoolLvl = 0;
-          xSemaphoreGive(gMutex);
-        }
-        // reset juga UI text
-        writeTextValue(OBJ_S_TSET, 1200.0f, 0);
-        writeTextValueInt(OBJ_S_TIME, 30);
-        writeTextValue(OBJ_S_WB, 5.0f, 2);
-        writeTextValue(OBJ_S_VOL, 0.0f, 2);
-      }
-      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bBlow1) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.blowerAirLvl = (g.blowerAirLvl + 1) % 3;
-          xSemaphoreGive(gMutex);
-        }
-      }
-      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bBlow2) {
-        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-          g.blowerCoolLvl = (g.blowerCoolLvl + 1) % 3;
-          xSemaphoreGive(gMutex);
-        }
-      }
-    }
-
-    if (nexSerial.available() > 128) {
-      nexDrainNonTouchReturns(2);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(5));
+    nexLoop(nex_listen_list);
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // ======================
-// TASK: NEXTION UI FLUSH
+// TASK: UI FLUSH (single writer to Nextion objects)
 // ======================
 static void taskUiFlush(void *pv) {
   UiUpdate u;
   for (;;) {
     while (xQueueReceive(qUi, &u, 0) == pdTRUE) {
-      if (u.isNum) nexSetNum(u.obj, u.num);
-      else nexSetTxt(u.obj, String(u.txt));
-      vTaskDelay(pdMS_TO_TICKS(5));
+      if (u.kind == UI_TXT) {
+        switch ((UiObjId)u.objId) {
+          case UI_TSTAT:      nxSetText(tStat, String(u.txt)); break;
+          case UI_TTIME:      nxSetText(tTime, String(u.txt)); break;
+          case UI_TTEMP:      nxSetText(tTemp, String(u.txt)); break;
+          case UI_TWEIGHT:    nxSetText(tWeight, String(u.txt)); break;
+          case UI_TVOL:       nxSetText(tVolume, String(u.txt)); break;
+          case UI_TBATCH:     nxSetText(tBatch, String(u.txt)); break;
+          case UI_TTOTW:      nxSetText(tTotWeight, String(u.txt)); break;
+          case UI_TFUEL:      nxSetText(tFuel, String(u.txt)); break;
+          case UI_TMAN_TEMP:  nxSetText(tManTemp, String(u.txt)); break;
+          case UI_TMAN_WEIGHT:nxSetText(tManWeight, String(u.txt)); break;
+          case UI_ST_TSET:    nxSetText(nTempSet, String(u.txt)); break;
+          case UI_ST_TIME:    nxSetText(nTimeSet, String(u.txt)); break;
+          case UI_ST_BATCH:   nxSetText(t2Batch, String(u.txt)); break;
+          case UI_ST_VOL:     nxSetText(t1Vol, String(u.txt)); break;
+          case UI_ST_BLOW1:   nxSetText(tBlow1txt, String(u.txt)); break;
+          case UI_ST_BLOW2:   nxSetText(tBlow2txt, String(u.txt)); break;
+          default: break;
+        }
+      } else {
+        switch ((UiObjId)u.objId) {
+          case UI_HFUEL:    nxSetProgress(hFuel, (int)u.num); break;
+          case UI_DSB_DIR:  nxSetDs(btManDir, u.num != 0); break;
+          default: break;
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // ======================
-// TASK: POLLER (REQ_ALL)
+// TASK: POLLER
 // ======================
 static void taskPoller(void *pv) {
   const TickType_t dt = pdMS_TO_TICKS(500);
@@ -877,7 +817,7 @@ static void taskPoller(void *pv) {
       uint32_t hh = (s / 3600);
       char b[16];
       snprintf(b, sizeof(b), "%02u:%02u", (unsigned)hh, (unsigned)mm);
-      enqueueUiTxt(OBJ_D_TIME, String(b));
+      uiEnqTxt(UI_TTIME, String(b));
     }
 
     vTaskDelay(dt);
@@ -885,7 +825,7 @@ static void taskPoller(void *pv) {
 }
 
 // ======================
-// TASK: UI RENDER (push shared state into Nextion)
+// TASK: UI RENDER (push shared state into UI queue)
 // ======================
 static void taskUiRender(void *pv) {
   const TickType_t dt = pdMS_TO_TICKS(250);
@@ -896,40 +836,36 @@ static void taskUiRender(void *pv) {
       xSemaphoreGive(gMutex);
     }
 
-    // DASHBOARD
-    enqueueUiTxt(OBJ_D_STAT, stateToText(s.autoRunning, s.estop));
-    enqueueUiTxt(OBJ_D_TEMP, fmt1(s.tempC));
-    enqueueUiTxt(OBJ_D_WEIGHT, fmt2(s.weightKg));
+    uiEnqTxt(UI_TSTAT, stateToText(s.autoRunning, s.estop));
+    uiEnqTxt(UI_TTEMP, fmt1(s.tempC));
+    uiEnqTxt(UI_TWEIGHT, fmt2(s.weightKg));
 
-    // placeholders
-    enqueueUiTxt(OBJ_D_VOL, fmt1(s.totalVolume));
-    enqueueUiTxt(OBJ_D_BATCH, String(s.totalBatch));
-    enqueueUiTxt(OBJ_D_TW, fmt2(s.totalWeight));
+    uiEnqTxt(UI_TVOL, fmt1(s.totalVolume));
+    uiEnqTxt(UI_TBATCH, String(s.totalBatch));
+    uiEnqTxt(UI_TTOTW, fmt2(s.totalWeight));
 
-    enqueueUiTxt(OBJ_D_FUEL, String((int)s.fuelPct) + "%");
-    enqueueUiNum(OBJ_D_HFUEL, (int)s.fuelPct);
+    uiEnqTxt(UI_TFUEL, String((int)s.fuelPct) + "%");
+    uiEnqNum(UI_HFUEL, (int)s.fuelPct);
 
-    // MANUAL snapshot
-    enqueueUiTxt(OBJ_M_TEMP, fmt1(s.tempC));
-    enqueueUiTxt(OBJ_M_WEIGHT, fmt2(s.weightKg));
+    uiEnqTxt(UI_TMAN_TEMP, fmt1(s.tempC));
+    uiEnqTxt(UI_TMAN_WEIGHT, fmt2(s.weightKg));
 
-    // SETTINGS snapshot (karena object setpoint adalah TEXT, kita tulis TXT, bukan .val)
-    // Ini hanya mirror dari g.* ke layar. Jika user klik UP/DOWN, g.* sudah di-update.
+    // mirror settings (TEXT objects)
     {
       char b[32];
       formatFloatNoTrailingZeros(s.setTemp, 0, b, sizeof(b));
-      enqueueUiTxt(OBJ_S_TSET, String(b));
+      uiEnqTxt(UI_ST_TSET, String(b));
     }
-    enqueueUiTxt(OBJ_S_TIME, String((unsigned)s.setTimeSec));
+    uiEnqTxt(UI_ST_TIME, String((unsigned)s.setTimeSec));
     {
       char b[32];
       formatFloatNoTrailingZeros(s.setBatchKg, 2, b, sizeof(b));
-      enqueueUiTxt(OBJ_S_WB, String(b));
+      uiEnqTxt(UI_ST_BATCH, String(b));
     }
     {
       char b[32];
       formatFloatNoTrailingZeros(s.setVolume, 2, b, sizeof(b));
-      enqueueUiTxt(OBJ_S_VOL, String(b));
+      uiEnqTxt(UI_ST_VOL, String(b));
     }
 
     auto lvlToTxt = [](int lvl) -> String {
@@ -937,32 +873,39 @@ static void taskUiRender(void *pv) {
       if (lvl == 1) return "LOW";
       return "HIGH";
     };
-    enqueueUiTxt(OBJ_S_BLOW1T, lvlToTxt(s.blowerAirLvl));
-    enqueueUiTxt(OBJ_S_BLOW2T, lvlToTxt(s.blowerCoolLvl));
+    uiEnqTxt(UI_ST_BLOW1, lvlToTxt(s.blowerAirLvl));
+    uiEnqTxt(UI_ST_BLOW2, lvlToTxt(s.blowerCoolLvl));
+
+    // mirror DSButton dir
+    uiEnqNum(UI_DSB_DIR, s.manDirOpen ? 1 : 0);
 
     vTaskDelay(dt);
   }
 }
 
 // ======================
-// BOOT INIT HMI (optional)
+// HMI INIT (boot)
 // ======================
 static void hmiBootInit() {
-  nexCmd("page 0");
-  nexSetTxt(OBJ_D_STAT, "IDLE");
-  nexSetTxt(OBJ_D_TEMP, "IDLE");
-  nexSetTxt(OBJ_D_WEIGHT, "IDLE");
-  nexSetTxt(OBJ_D_VOL, "0");
-  nexSetTxt(OBJ_D_BATCH, "0");
-  nexSetTxt(OBJ_D_TW, "0");
-  nexSetTxt(OBJ_D_FUEL, "0%");
-  nexSetProgress(OBJ_D_HFUEL, 0);
+  sendCommand("page 0");
 
-  // init setpoint text sesuai default g
-  writeTextValue(OBJ_S_TSET, g.setTemp, 0);
-  writeTextValueInt(OBJ_S_TIME, (int)g.setTimeSec);
-  writeTextValue(OBJ_S_WB, g.setBatchKg, 2);
-  writeTextValue(OBJ_S_VOL, g.setVolume, 2);
+  tStat.setText("IDLE");
+  tTemp.setText("IDLE");
+  tWeight.setText("IDLE");
+  tVolume.setText("0");
+  tBatch.setText("0");
+  tTotWeight.setText("0");
+  tFuel.setText("0%");
+  hFuel.setValue(0);
+
+  // init DSButton states
+  btManDir.setValue(g.manDirOpen ? 1 : 0);
+
+  // init setpoints
+  writeTextValue(nTempSet, g.setTemp, 0);
+  writeTextValueInt(nTimeSet, (int)g.setTimeSec);
+  writeTextValue(t2Batch, g.setBatchKg, 2);
+  writeTextValue(t1Vol, g.setVolume, 2);
 }
 
 // ======================
@@ -979,13 +922,13 @@ void setup() {
 
   // Nextion init
   nexSerial.begin(NEX_BAUD, SERIAL_8N1, NEX_RX, NEX_TX);
+  nexInit();
 
-  // sync primitives
+  // primitives
   gMutex = xSemaphoreCreateMutex();
   qRsTx  = xQueueCreate(24, sizeof(RsTxMsg));
-  qUi    = xQueueCreate(32, sizeof(UiUpdate));
+  qUi    = xQueueCreate(48, sizeof(UiUpdate));
 
-  // initial shared state
   if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     g.tempC = NAN;
     g.weightKg = NAN;
@@ -995,21 +938,52 @@ void setup() {
     xSemaphoreGive(gMutex);
   }
 
+  // Attach callbacks (release = attachPop)
+  btAuto.attachPop(cb_btAuto, &btAuto);
+  bStop.attachPop(cb_bStop, &bStop);
+
+  btManDir.attachPop(cb_btManDir, &btManDir);
+  b5StopManual.attachPop(cb_b5StopManual, &b5StopManual);
+  bManDoor.attachPop(cb_bManDoor, &bManDoor);
+  bManBDoor.attachPop(cb_bManBDoor, &bManBDoor);
+  bManPush.attachPop(cb_bManPush, &bManPush);
+  bManCon.attachPop(cb_bManCon, &bManCon);
+
+  btManIgn.attachPop(cb_btManIgn, &btManIgn);
+  btManBurn.attachPop(cb_btManBurn, &btManBurn);
+
+  hManSpeed.attachPop(cb_hManSpeed, &hManSpeed);
+  hManStep.attachPop(cb_hManStep, &hManStep);
+
+  bsettingStop.attachPop(cb_bsettingStop, &bsettingStop);
+  bTempUp.attachPop(cb_bTempUp, &bTempUp);
+  bTempDn.attachPop(cb_bTempDn, &bTempDn);
+  bTimeUp.attachPop(cb_bTimeUp, &bTimeUp);
+  bTimeDn.attachPop(cb_bTimeDn, &bTimeDn);
+  bBatchUp.attachPop(cb_bBatchUp, &bBatchUp);
+  bBatchDn.attachPop(cb_bBatchDn, &bBatchDn);
+  bVolUp.attachPop(cb_bVolUp, &bVolUp);
+  bVolDn.attachPop(cb_bVolDn, &bVolDn);
+  bBlow1.attachPop(cb_bBlow1, &bBlow1);
+  bBlow2.attachPop(cb_bBlow2, &bBlow2);
+
+  bSave.attachPop(cb_bSave, &bSave);
+  bReset.attachPop(cb_bReset, &bReset);
+
   hmiBootInit();
 
-  // tasks
+  // Tasks
   xTaskCreatePinnedToCore(taskRsTx,     "rsTx",     4096, nullptr, 3, nullptr, 1);
   xTaskCreatePinnedToCore(taskRsRx,     "rsRx",     4096, nullptr, 3, nullptr, 1);
-  xTaskCreatePinnedToCore(taskNexRx,    "nexRx",    6144, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(taskNexLoop,  "nexLoop",  4096, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskUiFlush,  "uiFlush",  4096, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(taskPoller,   "poller",   4096, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(taskUiRender, "uiRender", 4096, nullptr, 1, nullptr, 0);
 
-  // initial poll
   enqueueRs(NODE_TEMP, "REQ_ALL");
   enqueueRs(NODE_WEIGHT, "REQ_ALL");
 
-  Serial.println("[MASTER] READY");
+  Serial.println("[MASTER] READY (Nextion library mode)");
 }
 
 void loop() {
