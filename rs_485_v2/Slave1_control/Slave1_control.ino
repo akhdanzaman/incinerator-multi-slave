@@ -14,6 +14,9 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
 
+static const uint8_t NODE_ID = 1;
+
+
 // =========================
 // PINS
 // =========================
@@ -222,7 +225,6 @@ uint32_t burnerActiveTimeSec = 30;
 
 // Sensor mirrors (diinject)
 float currentTempC = 0.0f;
-float currentWeightKg = 0.0f;
 
 // Fuel
 int FUEL_ADC_EMPTY = 200;
@@ -286,6 +288,8 @@ unsigned long lastSensorTxMs = 0;
 unsigned long lastProgTxMs = 0;
 unsigned long lastFuelTxMs = 0;
 unsigned long lastMetricsTxMs = 0;
+
+
 
 // =========================
 // CORE HELPERS
@@ -423,96 +427,7 @@ static inline bool doorHomePressed() {
   return digitalRead(LIMIT_PIN_DOOR_HOME) == LOW;
 }
 
-void homeDoor() {
-  const int HOME_DIR = -1;
-  const float SEEK_SPEED_1 = 500;
-  const float SEEK_SPEED_2 = 100;
-  const long  BACKOFF_STEPS = 300;
 
-  const unsigned long HOMING_TIMEOUT_MS = 30000;
-  const uint8_t PRESS_STABLE_COUNT = 8;
-  const uint8_t RELEASE_STABLE_COUNT = 8;
-
-  auto waitPressedStable = [&](float spd) {
-    const unsigned long t0 = millis();
-    uint8_t cnt = 0;
-    stepperDoor.setSpeed(spd);
-    while (cnt < PRESS_STABLE_COUNT) {
-      stepperDoor.runSpeed();
-      if (doorHomePressed()) cnt++; else cnt = 0;
-      if (millis() - t0 > HOMING_TIMEOUT_MS) return false;
-    }
-    return true;
-  };
-
-  auto waitReleasedStable = [&](float spd) {
-    const unsigned long t0 = millis();
-    uint8_t cnt = 0;
-    stepperDoor.setSpeed(spd);
-    while (cnt < RELEASE_STABLE_COUNT) {
-      stepperDoor.runSpeed();
-      if (!doorHomePressed()) cnt++; else cnt = 0;
-      if (millis() - t0 > HOMING_TIMEOUT_MS) return false;
-    }
-    return true;
-  };
-
-  stepperDoor.setAcceleration(200);
-  stepperDoor.setMaxSpeed(10000);
-
-  Serial.print("Homing door... limitRaw=");
-  Serial.println(digitalRead(LIMIT_PIN_DOOR_HOME));
-
-  if (doorHomePressed()) {
-    if (!waitReleasedStable(-HOME_DIR * SEEK_SPEED_1)) {
-      stepperDoor.setSpeed(0);
-      Serial.println("ERR: Door homing timeout (release). Check switch/wiring");
-      return;
-    }
-  }
-
-  if (!waitPressedStable(HOME_DIR * SEEK_SPEED_1)) {
-    stepperDoor.setSpeed(0);
-    Serial.println("ERR: Door homing timeout (seek1). Flip HOME_DIR if direction wrong");
-    return;
-  }
-
-  stepperDoor.setCurrentPosition(0);
-  stepperDoor.moveTo(-HOME_DIR * BACKOFF_STEPS);
-  while (stepperDoor.distanceToGo() != 0) {
-    stepperDoor.run();
-  }
-
-  if (doorHomePressed()) {
-    if (!waitReleasedStable(-HOME_DIR * SEEK_SPEED_2)) {
-      stepperDoor.setSpeed(0);
-      Serial.println("ERR: Door homing timeout (release2). Check switch/wiring");
-      return;
-    }
-  }
-
-  if (!waitPressedStable(HOME_DIR * SEEK_SPEED_2)) {
-    stepperDoor.setSpeed(0);
-    Serial.println("ERR: Door homing timeout (seek2). Flip HOME_DIR if direction wrong");
-    return;
-  }
-
-  stepperDoor.setCurrentPosition(0);
-  stepperDoor.moveTo(0);
-
-  Serial.println("OK: Door homed (pos=0)");
-    // =========================
-  // OPTION A: Setelah homing, tutup pintu otomatis
-  // (sama persis seperti perintah MAINDOOR_CLOSE)
-  // =========================
-  cmdMainDoorClose();
-
-  while (stepperDoor.distanceToGo() != 0) {
-  stepperDoor.run();
-  }
-
-  Serial.println("OK: Door closed after homing");
-}
 
 // =========================
 // PUSHER HOMING
@@ -785,7 +700,36 @@ static bool parseToFrame(const String &line, uint8_t &idOut, String &payloadOut)
   return false;
 }
 
-void processRs485Rx() {
+static inline void sendToMaster1(const String &payload) {
+  rs485SendRawLine(String("N01:") + payload);
+}
+
+static void processRs485CommandsForMe() {
+  while (RS485_BUS.available()) {
+    char c = (char)RS485_BUS.read();
+    if (c == 10) { // '\n'
+      rs485Buf.trim();
+      if (rs485Buf.length() > 0) {
+        uint8_t id;
+        String payload;
+        if (parseToFrame(rs485Buf, id, payload)) {
+          // HANYA terima command yang ditujukan ke Mega ini
+          if (rs485Buf.startsWith("TO") && id == NODE_ID) {
+            handleCommand(payload);     // ini reuse handler USB kamu. good.
+          }
+          // kalau kamu masih mau monitor N02/N03, boleh tetap di sini, tapi pisahin bloknya.
+        }
+      }
+      rs485Buf = "";
+    } else if (c != 13) {
+      rs485Buf += c;
+      if (rs485Buf.length() > 200) rs485Buf = "";
+    }
+  }
+}
+
+
+void processRs485RxSensors() {
   while (RS485_BUS.available()) {
     char c = (char)RS485_BUS.read();
 
@@ -826,6 +770,40 @@ void processRs485Rx() {
       rs485Buf += c;
       // optional safety biar buffer nggak ngembang kalau data kacau
       if (rs485Buf.length() > 200) rs485Buf = "";
+    }
+  }
+}
+
+
+static void processRs485Unified() {
+  while (RS485_BUS.available()) {
+    char c = (char)RS485_BUS.read();
+    if (c == 10) { // '\n'
+      rs485Buf.trim();
+      if (rs485Buf.length()) {
+        uint8_t id; String payload;
+        if (parseToFrame(rs485Buf, id, payload)) {
+
+          // 1) Command dari Master: TO01:<cmd>
+          if (rs485Buf.startsWith("TO") && id == NODE_ID) {
+            handleCommand(payload);
+          }
+
+          // 2) Telemetry dari node lain: N02 / N03
+          if (rs485Buf.startsWith("N")) {
+            if (id == NODE_TEMP && payload.startsWith("TEMP:")) {
+              currentTempC = payload.substring(5).toFloat();
+            }
+            if (id == NODE_WEIGHT && payload.startsWith("WEIGHT:")) {
+              loadWeight = payload.substring(7).toFloat();
+            }
+          }
+        }
+      }
+      rs485Buf = "";
+    } else if (c != 13) {
+      rs485Buf += c;
+      if (rs485Buf.length() > 220) rs485Buf = "";
     }
   }
 }
@@ -1718,6 +1696,7 @@ void setup() {
 
   pinMode(LIMIT_PIN_PUSH_HOME, INPUT_PULLUP);
   pinMode(LIMIT_PIN_DOOR_HOME, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_BDOOR_HOME, INPUT_PULLUP);
 
   pinMode(RELAY_IGNITION, OUTPUT);
   pinMode(RELAY_BLOWER, OUTPUT);
@@ -1755,6 +1734,97 @@ void setup() {
   Serial.println("  (also accepts typo: CONVERYOR_STOP)");
 }
 
+void homeDoor() {
+  const int HOME_DIR = -1;
+  const float SEEK_SPEED_1 = 500;
+  const float SEEK_SPEED_2 = 100;
+  const long  BACKOFF_STEPS = 300;
+
+  const unsigned long HOMING_TIMEOUT_MS = 30000;
+  const uint8_t PRESS_STABLE_COUNT = 8;
+  const uint8_t RELEASE_STABLE_COUNT = 8;
+
+  auto waitPressedStable = [&](float spd) {
+    const unsigned long t0 = millis();
+    uint8_t cnt = 0;
+    stepperDoor.setSpeed(spd);
+    while (cnt < PRESS_STABLE_COUNT) {
+      stepperDoor.runSpeed();
+      if (doorHomePressed()) cnt++; else cnt = 0;
+      if (millis() - t0 > HOMING_TIMEOUT_MS) return false;
+    }
+    return true;
+  };
+
+  auto waitReleasedStable = [&](float spd) {
+    const unsigned long t0 = millis();
+    uint8_t cnt = 0;
+    stepperDoor.setSpeed(spd);
+    while (cnt < RELEASE_STABLE_COUNT) {
+      stepperDoor.runSpeed();
+      if (!doorHomePressed()) cnt++; else cnt = 0;
+      if (millis() - t0 > HOMING_TIMEOUT_MS) return false;
+    }
+    return true;
+  };
+
+  stepperDoor.setAcceleration(200);
+  stepperDoor.setMaxSpeed(10000);
+
+  Serial.print("Homing door... limitRaw=");
+  Serial.println(digitalRead(LIMIT_PIN_DOOR_HOME));
+
+  if (doorHomePressed()) {
+    if (!waitReleasedStable(-HOME_DIR * SEEK_SPEED_1)) {
+      stepperDoor.setSpeed(0);
+      Serial.println("ERR: Door homing timeout (release). Check switch/wiring");
+      return;
+    }
+  }
+
+  if (!waitPressedStable(HOME_DIR * SEEK_SPEED_1)) {
+    stepperDoor.setSpeed(0);
+    Serial.println("ERR: Door homing timeout (seek1). Flip HOME_DIR if direction wrong");
+    return;
+  }
+
+  stepperDoor.setCurrentPosition(0);
+  stepperDoor.moveTo(-HOME_DIR * BACKOFF_STEPS);
+  while (stepperDoor.distanceToGo() != 0) {
+    stepperDoor.run();
+  }
+
+  if (doorHomePressed()) {
+    if (!waitReleasedStable(-HOME_DIR * SEEK_SPEED_2)) {
+      stepperDoor.setSpeed(0);
+      Serial.println("ERR: Door homing timeout (release2). Check switch/wiring");
+      return;
+    }
+  }
+
+  if (!waitPressedStable(HOME_DIR * SEEK_SPEED_2)) {
+    stepperDoor.setSpeed(0);
+    Serial.println("ERR: Door homing timeout (seek2). Flip HOME_DIR if direction wrong");
+    return;
+  }
+
+  stepperDoor.setCurrentPosition(0);
+  stepperDoor.moveTo(0);
+
+  Serial.println("OK: Door homed (pos=0)");
+    // =========================
+  // OPTION A: Setelah homing, tutup pintu otomatis
+  // (sama persis seperti perintah MAINDOOR_CLOSE)
+  // =========================
+  cmdMainDoorClose();
+
+  while (stepperDoor.distanceToGo() != 0) {
+  stepperDoor.run();
+  }
+
+  Serial.println("OK: Door closed after homing");
+}
+
 // =========================
 // LOOP
 // =========================
@@ -1763,7 +1833,9 @@ void loop() {
   runAllSteppers();
 
   // one-shot service (non-blocking)
-  serviceOneShot();  rs485SetTx(false); serviceAutoSeq();
+  serviceOneShot();  
+  // rs485SetTx(false); 
+  serviceAutoSeq();
 
 
   // slow tick services
@@ -1780,6 +1852,7 @@ void loop() {
   processUsbCommands();
 
   // RS485 sensors + periodic print
-  processRs485Rx();
+  processRs485Unified();
+
   periodicPrint();
 }
