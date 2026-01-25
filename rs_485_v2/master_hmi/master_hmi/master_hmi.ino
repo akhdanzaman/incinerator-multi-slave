@@ -16,6 +16,23 @@
 #include <Arduino.h>
 
 // ======================
+// UI OBJ ID MAP (for UI queue)
+// ======================
+enum UiObjId : uint16_t {
+  UI_TSTAT=1, UI_TTIME, UI_TTEMP, UI_TWEIGHT,
+  UI_TVOL, UI_TBATCH, UI_TTOTW, UI_TFUEL,
+  UI_HFUEL,
+
+  UI_TMAN_TEMP, UI_TMAN_WEIGHT,
+  UI_DSB_DIR,
+
+  UI_ST_TSET, UI_ST_TIME, UI_ST_BATCH, UI_ST_VOL,
+  UI_ST_BLOW1, UI_ST_BLOW2
+};
+
+
+
+// ======================
 // NEXTION (UART2)
 // ======================
 #include <Nextion.h>
@@ -292,20 +309,7 @@ NexTouch *nex_listen_list[] = {
   NULL
 };
 
-// ======================
-// UI OBJ ID MAP (for UI queue)
-// ======================
-enum UiObjId : uint16_t {
-  UI_TSTAT=1, UI_TTIME, UI_TTEMP, UI_TWEIGHT,
-  UI_TVOL, UI_TBATCH, UI_TTOTW, UI_TFUEL,
-  UI_HFUEL,
 
-  UI_TMAN_TEMP, UI_TMAN_WEIGHT,
-  UI_DSB_DIR,
-
-  UI_ST_TSET, UI_ST_TIME, UI_ST_BATCH, UI_ST_VOL,
-  UI_ST_BLOW1, UI_ST_BLOW2
-};
 
 static void uiEnqTxt(UiObjId id, const String &s) {
   UiUpdate u{};
