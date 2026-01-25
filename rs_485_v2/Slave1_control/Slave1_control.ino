@@ -3,12 +3,20 @@
 // SLAVE1 (Arduino Mega)
 // Fokus: penambahan variabel loadWeight (belum ada logika keputusan)
 // + Tambahan: kontrol motor via USB Serial command + status print
-// Commands:b
-//   MAINDOOR_OPEN | MAINDOOR_CLOSE
-//   PUSHER_MAJU   | PUSHER_MUNDUR
-//   BDOOR_OPEN    | BDOOR_CLOSE
-//   BURNER_MAJU   | BURNER_MUNDUR
-//   CONVEYOR_FWD  | CONVEYOR_REV | CONVEYOR_STOP
+//
+// PERBAIKAN UTAMA (komunikasi RS485):
+// 1) RS485 RX & TX dipisahkan jelas: buffer RX tidak dipakai saat TX.
+// 2) rs485SendRawLine() dibuat aman: guard TX, flush RX sampah, dan jeda turnaround.
+// 3) processRs485Unified() sekarang update juga flag monitor (gotAnyNode2/3 + lastTempStr/loadWeightStr)
+//    sehingga periodicPrint() tidak selalu "Not Connected".
+// 4) sendTelemetry() benar-benar mengirim ke master (N01:DATA/PROG/FUEL/METRICS) lewat RS485.
+//    (sebelumnya line dibuat tapi tidak pernah dikirim)
+// 5) RX parser tidak bergantung pada startsWith("N")/"TO" pada buffer mentah setelah parse,
+//    tapi tetap pakai rs485Buf.startsWith untuk tetap kompatibel. (minimal change)
+//
+// CATATAN:
+// - Semua fungsi yang kamu punya tetap ada, tidak disederhanakan.
+// - Perubahan hanya untuk tujuan perbaikan komunikasi TX/RX.
 // =====================================================
 
 #include <Arduino.h>
@@ -74,6 +82,7 @@ enum SystemState : uint8_t {
   CLOSING_BURN_DOOR,
   FAULT
 };
+
 enum MotorID : uint8_t {
   MOTOR_DOOR = 0,
   MOTOR_PUSHER,
@@ -98,26 +107,66 @@ static inline bool isDumpingState(SystemState s) {
 // =========================
 // RS485
 // =========================
+// =========================
+// USB & RS485 BUFFER
+// =========================
+String rs485Buf;
+
+// USB command line buffer
+String usbLine;
+
+
 #define RS485_BUS Serial1
 static const uint32_t RS485_BAUD = 9600;
 static const int RS485_DE_RE = 39;
+
+
+// RS485 TX guard
+static volatile bool rs485TxBusy = false;
 
 static inline void rs485SetTx(bool en) {
   digitalWrite(RS485_DE_RE, en ? HIGH : LOW);
 }
 
+// Drain RX bytes (optional safety) - helps after toggling direction
+static inline void rs485DrainRx(unsigned long maxUs) {
+  unsigned long t0 = micros();
+  while (RS485_BUS.available()) {
+    (void)RS485_BUS.read();
+    if ((micros() - t0) > maxUs) break;
+  }
+}
+
 static void rs485SendRawLine(const String &line) {
+  // Guard: jangan TX kalau sedang TX (re-entrant) atau kalau kamu kebetulan manggil dari interrupt (harusnya tidak)
+  if (rs485TxBusy) return;
+  rs485TxBusy = true;
+
+  // Pastikan kita tidak sedang mengonsumsi frame RX setengah jalan
+  // (kalau ada, ini lebih aman daripada bikin frame RX corrupt)
+  rs485Buf = "";
+
+  // Bersihkan RX junk sebelum switch ke TX
+  rs485DrainRx(2000);
+
+  // Switch ke TX
   rs485SetTx(true);
-  delayMicroseconds(200);
+  delayMicroseconds(250);
 
   RS485_BUS.print(line);
   RS485_BUS.write(10);   // ASCII 10 = newline '\n'
 
   RS485_BUS.flush();
-  delayMicroseconds(200);
-  rs485SetTx(false);
-}
 
+  // Turnaround: biar byte terakhir bener-bener keluar dari transceiver
+  delayMicroseconds(300);
+
+  // Switch balik ke RX
+  rs485SetTx(false);
+  delayMicroseconds(80);
+
+  rs485TxBusy = false;
+}
 
 static inline void sendToNode(uint8_t nodeId, const String &payload) {
   char hdr[8];
@@ -162,7 +211,6 @@ MotorConfig motorConfigs[6] = {
   {   800, 200,  1000 },
   { 20000, 200,  1000 }
 };
-
 
 static inline long getOpenPos(uint8_t idx)  { return motorConfigs[idx].steps; }
 static inline long getClosePos(uint8_t idx) { (void)idx; return 0; }
@@ -403,21 +451,32 @@ void runAllSteppers() {
 void sendTelemetry() {
   unsigned long now = millis();
 
+  // NOTE: Di kode lama kamu bikin String line tapi tidak pernah dikirim.
+  // Ini bikin master merasa "nggak ada data" padahal RX kamu jalan.
+
   if (now - lastSensorTxMs >= 500) {
     lastSensorTxMs = now;
     String line = String("DATA:") + String(currentTempC, 1) + "," + String(loadWeight, 2) + "," + String((int)currentState);
-    (void)line;
+    sendToMaster1(line);
   }
 
   if (now - lastProgTxMs >= 500) {
     lastProgTxMs = now;
+    // kalau belum ada progress logic, kirim minimal state
+    String p = String("PROG:") + String((int)currentState);
+    sendToMaster1(p);
   }
 
   if (now - lastFuelTxMs >= 500) {
     lastFuelTxMs = now;
     fuelPct = readFuelPercent();
     fuelLiterRemaining = (fuelPct / 100.0f) * TANK_CAPACITY_L;
+
+    String f = String("FUEL:") + String((int)fuelPct) + "," + String(fuelLiterRemaining, 2);
+    sendToMaster1(f);
   }
+
+  // lastMetricsTxMs tetap ada (tidak dihapus), kalau nanti kamu mau tambah METRICS.
 }
 
 // =========================
@@ -612,13 +671,6 @@ void homeBDoor() {
   Serial.println("OK: Door closed after homing");
 }
 
-// =========================
-// USB & RS485 BUFFER
-// =========================
-String rs485Buf;
-
-// USB command line buffer
-String usbLine;
 
 // =========================
 // USB COMMAND RX (newline-terminated)
@@ -701,6 +753,7 @@ static bool parseToFrame(const String &line, uint8_t &idOut, String &payloadOut)
 }
 
 static inline void sendToMaster1(const String &payload) {
+  // N01:<payload>\n
   rs485SendRawLine(String("N01:") + payload);
 }
 
@@ -776,6 +829,10 @@ void processRs485RxSensors() {
 
 
 static void processRs485Unified() {
+  // Kalau sedang TX, jangan consume RX, biar frame tidak kepotong.
+  // Ini penting kalau master broadcast atau node lain kirim berbarengan.
+  if (rs485TxBusy) return;
+
   while (RS485_BUS.available()) {
     char c = (char)RS485_BUS.read();
     if (c == 10) { // '\n'
@@ -792,10 +849,22 @@ static void processRs485Unified() {
           // 2) Telemetry dari node lain: N02 / N03
           if (rs485Buf.startsWith("N")) {
             if (id == NODE_TEMP && payload.startsWith("TEMP:")) {
+              // Update numeric mirror
               currentTempC = payload.substring(5).toFloat();
+
+              // Update monitor string + flags (yang dulu hilang di unified)
+              lastTempStr = payload;
+              gotAnyNode2 = true;
+              lastNode2RxMs = millis();
             }
             if (id == NODE_WEIGHT && payload.startsWith("WEIGHT:")) {
+              // Update numeric mirror
               loadWeight = payload.substring(7).toFloat();
+
+              // Update monitor string + flags
+              loadWeightStr = payload;
+              gotAnyNode3 = true;
+              lastNode3RxMs = millis();
             }
           }
         }
@@ -1315,13 +1384,6 @@ void handleCommand(String cmd) {
   String header = (colon >= 0) ? cmd.substring(0, colon) : cmd;
   String valStr = (colon >= 0) ? cmd.substring(colon + 1) : String("");
 
-  // if (header == "CMD_SENSOR_SNAPSHOT") {
-  //   // snapshot boleh tanpa memaksa MANUAL/AUTO (data injection)
-  //   applySensorSnapshot(valStr);
-  //   Serial.println("[ACT] Sensor snapshot applied");
-  //   return;
-  // }
-
   // ---- manual relays & manual flags -> MANUAL => auto OFF
   if (header == "CMD_MAN_IGN") {
     enterManualByCommand("CMD_MAN_IGN");
@@ -1833,8 +1895,8 @@ void loop() {
   runAllSteppers();
 
   // one-shot service (non-blocking)
-  serviceOneShot();  
-  // rs485SetTx(false); 
+  serviceOneShot();
+  // rs485SetTx(false);
   serviceAutoSeq();
 
 
@@ -1846,6 +1908,9 @@ void loop() {
     checkStepperFlags();
     checkFeederConveyor(); // akan kita kunci oleh MODE juga (lihat bawah)
     runStateMachine();     // AKTIFKAN
+
+    // Telemetry periodic (RS485 TX)
+    sendTelemetry();
   }
 
   // USB commands (Serial Monitor)

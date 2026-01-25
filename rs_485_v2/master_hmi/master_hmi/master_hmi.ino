@@ -22,6 +22,12 @@
  *   Master ini mengasumsikan MEGA sudah dimodif sederhana untuk menerima frame TO01:<cmd>
  *   dan memanggil handleCommand(<cmd>) seperti handler USB-nya.
  *   Kalau belum, kamu harus tambah RX RS485 di MEGA agar bisa dikendalikan dari master.
+ *
+ * PERBAIKAN UTAMA (Nextion plug-n-play):
+ * - Input Nextion tidak lagi pakai string EVT + newline.
+ * - Sekarang pakai event default Nextion: Touch Event 0x65 (65 pp cc ee FF FF FF)
+ * - Tidak perlu setting event script apa pun di Nextion.
+ * - Kamu cukup isi DEFINE component id & page id sesuai desain HMI kamu.
  */
 
 #include <Arduino.h>
@@ -29,8 +35,6 @@
 // ======================
 // NEXTION (UART2)
 // ======================
-// ESP32 default:
-//   Serial2 RX=16 TX=17 (bisa kamu ubah)
 static HardwareSerial &nexSerial = Serial2;
 static const int NEX_RX = 16;
 static const int NEX_TX = 17;
@@ -267,29 +271,94 @@ static String fmt2(float v) {
   return String(b);
 }
 
-// ======================
-// NEXTION INPUT FORMAT (disarankan)
-// ======================
-// Supaya simple dan stabil, set tiap button/touch event di Nextion untuk mengirim string:
-//   prints "EVT:<name>:<val>" ,0
-// lalu kirim newline dengan: print "\r\n"
-// Example (On Release bStop):
-//   prints "EVT:bStop:1",0
-//   print "\r\n"
-// Slider: EVT:hManSpeed:<value>
+// =====================================================
+// NEXTION INPUT (DEFAULT TOUCH EVENT 0x65) - PLUG N PLAY
+// =====================================================
+// Nextion default touch event (return code):
+//   0x65  pageId  compId  event  0xFF 0xFF 0xFF
+// event: biasanya 0x00 = release, 0x01 = press
 //
-// Master akan parse baris ASCII ini.
+// Kamu cukup set page id & component id (di Nextion editor sudah ada fieldnya).
+// Tidak perlu script event sama sekali.
+//
+// NOTE:
+// - Nextion juga bisa mengirim return lain (0x66, 0x70, 0x71, error, dsb).
+//   Parser ini akan sinkronisasi dan hanya memicu saat frame 0x65 valid.
 
-static bool parseEvtLine(const String &line, String &nameOut, String &valOut) {
-  // EVT:name:val
-  if (!line.startsWith("EVT:")) return false;
-  int p1 = line.indexOf(':', 4);
-  if (p1 < 0) return false;
-  nameOut = line.substring(4, p1);
-  valOut  = line.substring(p1 + 1);
-  nameOut.trim();
-  valOut.trim();
-  return nameOut.length() > 0;
+// ---- isi sendiri sesuai HMI kamu ----
+// PAGE IDs
+#define NEX_PAGE_DASH      0   // <- isi
+#define NEX_PAGE_MANUAL    1   // <- isi
+#define NEX_PAGE_SETTINGS  2   // <- isi
+
+// DASH component IDs
+#define NEX_CID_btAuto       0   // <- isi
+#define NEX_CID_bStop        0   // <- isi
+
+// MANUAL component IDs
+#define NEX_CID_bManDoor     0   // <- isi
+#define NEX_CID_bManBDoor    0   // <- isi
+#define NEX_CID_bManPush     0   // <- isi
+#define NEX_CID_bManCon      0   // <- isi (bisa cycle/segmented button)
+#define NEX_CID_btManIgn     0   // <- isi
+#define NEX_CID_btManBum     0   // <- isi
+#define NEX_CID_hManSpeed    0   // <- isi (slider)
+#define NEX_CID_hManStep     0   // <- isi (slider)
+#define NEX_CID_b5Stop       0   // <- isi (stop di page manual)
+
+// SETTINGS component IDs
+#define NEX_CID_bSave         0   // <- isi
+#define NEX_CID_bReset        0   // <- isi
+#define NEX_CID_bsettingStop  0   // <- isi
+#define NEX_CID_nTempSet      0   // <- isi (number)
+#define NEX_CID_nTimeSet      0   // <- isi (number)
+#define NEX_CID_t2Batch       0   // <- isi (text/number)
+#define NEX_CID_t1Vol         0   // <- isi (text/number)
+#define NEX_CID_bBlow1        0   // <- isi (button)
+#define NEX_CID_bBlow2        0   // <- isi (button)
+
+// -----------------------------------------------------
+// Default touch frame reader (robust sync)
+// -----------------------------------------------------
+static bool nexReadTouch(uint8_t &page, uint8_t &comp, uint8_t &evt) {
+  // Frame: 65 pp cc ee FF FF FF
+  static uint8_t buf[7];
+  static uint8_t idx = 0;
+
+  while (nexSerial.available()) {
+    uint8_t b = (uint8_t)nexSerial.read();
+
+    // sync to 0x65
+    if (idx == 0) {
+      if (b != 0x65) continue;
+      buf[idx++] = b;
+      continue;
+    }
+
+    buf[idx++] = b;
+
+    if (idx == 7) {
+      idx = 0;
+      if (buf[0] == 0x65 && buf[4] == 0xFF && buf[5] == 0xFF && buf[6] == 0xFF) {
+        page = buf[1];
+        comp = buf[2];
+        evt  = buf[3];
+        return true;
+      }
+      // if invalid, continue scanning
+    }
+  }
+
+  return false;
+}
+
+// OPTIONAL: baca numeric/text return jika kamu nanti mau tanpa script.
+// Saat ini tidak dipakai (tetap ada, tidak mengganggu).
+static void nexDrainNonTouchReturns(unsigned long maxMs) {
+  unsigned long t0 = millis();
+  while (nexSerial.available() && (millis() - t0) < maxMs) {
+    (void)nexSerial.read();
+  }
 }
 
 // ======================
@@ -393,174 +462,166 @@ static void taskRsRx(void *pv) {
 }
 
 // ======================
-// TASK: NEXTION RX
+// TASK: NEXTION RX (DEFAULT TOUCH)
 // ======================
 static void taskNexRx(void *pv) {
-  String line;
-  line.reserve(160);
-
   for (;;) {
-    while (nexSerial.available()) {
-      char c = (char)nexSerial.read();
-      if (c == '\r') continue;
-      if (c == '\n') {
-        line.trim();
-        if (line.length()) {
-          String name, val;
-          if (parseEvtLine(line, name, val)) {
-            // handle events
-            if (name == "bStop" || name == "b5" || name == "bsettingStop") {
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.estop = true;
-                g.autoRunning = false;
-                xSemaphoreGive(gMutex);
-              }
-              // broadcast emergency stop to MEGA (and others if you want)
-              enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
-            }
-            else if (name == "btAuto") {
-              // Start auto cycle
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.estop = false;
-                g.autoRunning = true;
-                xSemaphoreGive(gMutex);
-              }
-              // prefer the direct macro you already used
-              enqueueRs(NODE_MEGA_ACT, "CMD_RUN_AUTO");
-            }
-            else if (name == "bManDoor") {
-              bool open = (val.toInt() != 0);
-              enqueueRs(NODE_MEGA_ACT, open ? "MAINDOOR_OPEN" : "MAINDOOR_CLOSE");
-            }
-            else if (name == "bManBDoor") {
-              bool open = (val.toInt() != 0);
-              enqueueRs(NODE_MEGA_ACT, open ? "BDOOR_OPEN" : "BDOOR_CLOSE");
-            }
-            else if (name == "bManPush") {
-              bool maju = (val.toInt() != 0);
-              enqueueRs(NODE_MEGA_ACT, maju ? "PUSHER_MAJU" : "PUSHER_MUNDUR");
-            }
-            else if (name == "bManCon") {
-              int v = val.toInt();
-              if (v == 0) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_STOP");
-              else if (v == 1) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_FWD");
-              else enqueueRs(NODE_MEGA_ACT, "CONVEYOR_REV");
-            }
-            else if (name == "btManIgn") {
-              int v = val.toInt();
-              enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_IGN:") + String(v));
-            }
-            else if (name == "btManBum") {
-              int v = val.toInt();
-              enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_BURN:") + String(v));
-            }
-            else if (name == "hManSpeed") {
-              int spd = val.toInt();
-              if (spd < 0) spd = 0;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.manSpeed = spd;
-                xSemaphoreGive(gMutex);
-              }
-              // contoh: set conveyor speed atau motor speed (perlu definisi di MEGA)
-              // enqueueRs(NODE_MEGA_ACT, String("SET_MAN_SPD:") + String(spd));
-            }
-            else if (name == "hManStep") {
-              int stp = val.toInt();
-              if (stp < 0) stp = 0;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.manSteps = stp;
-                xSemaphoreGive(gMutex);
-              }
-              // contoh: set manual steps (perlu definisi di MEGA)
-              // enqueueRs(NODE_MEGA_ACT, String("SET_MAN_STP:") + String(stp));
-            }
-            else if (name == "bSave") {
-              // push settings ke MEGA
-              float setTemp; uint32_t setTime; float setBatch; float setVol;
-              int b1, b2;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                setTemp = g.setTemp;
-                setTime = g.setTimeSec;
-                setBatch = g.setBatchKg;
-                setVol = g.setVolume;
-                b1 = g.blowerAirLvl;
-                b2 = g.blowerCoolLvl;
-                xSemaphoreGive(gMutex);
-              }
-              enqueueRs(NODE_MEGA_ACT, String("SET_TE:") + String(setTemp, 1));
-              enqueueRs(NODE_MEGA_ACT, String("SET_TI:") + String((unsigned)setTime));
-              enqueueRs(NODE_MEGA_ACT, String("SET_W:")  + String(setBatch, 2));
-              // volume placeholder
-              // enqueueRs(NODE_MEGA_ACT, String("SET_V:") + String(setVol, 2));
-              enqueueRs(NODE_MEGA_ACT, String("BLOW:air:") + String(b1));
-              enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(b2));
-            }
-            else if (name == "bReset") {
-              // reset local settings (dan optionally minta MEGA reload EEPROM)
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.setTemp = 1200.0f;
-                g.setTimeSec = 30;
-                g.setBatchKg = 5.0f;
-                g.setVolume = 0;
-                g.blowerAirLvl = 0;
-                g.blowerCoolLvl = 0;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "tTempSet" || name == "nTempSet") {
-              // kalau Nextion mengirim nilai numeric
-              float t = val.toFloat();
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.setTemp = t;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "nTimeSet") {
-              uint32_t s = (uint32_t)val.toInt();
-              if (s < 1) s = 1;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.setTimeSec = s;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "t2") {
-              float w = val.toFloat();
-              if (w < 0) w = 0;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.setBatchKg = w;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "t1") {
-              float v = val.toFloat();
-              if (v < 0) v = 0;
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.setVolume = v;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "bBlow1") {
-              int lvl = val.toInt();
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.blowerAirLvl = lvl;
-                xSemaphoreGive(gMutex);
-              }
-            }
-            else if (name == "bBlow2") {
-              int lvl = val.toInt();
-              if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                g.blowerCoolLvl = lvl;
-                xSemaphoreGive(gMutex);
-              }
-            }
-          }
+    uint8_t page = 0, comp = 0, evt = 0;
+
+    // process all available touch frames
+    while (nexReadTouch(page, comp, evt)) {
+      // We act on RELEASE by default (lebih stabil, mencegah double-trigger)
+      const bool isRelease = (evt == 0x00);
+      if (!isRelease) continue;
+
+      // DASH
+      if (page == NEX_PAGE_DASH && comp == NEX_CID_bStop) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.estop = true;
+          g.autoRunning = false;
+          xSemaphoreGive(gMutex);
         }
-        line = "";
-      } else {
-        line += c;
-        if (line.length() > 140) line = "";
+        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
       }
+      else if (page == NEX_PAGE_DASH && comp == NEX_CID_btAuto) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.estop = false;
+          g.autoRunning = true;
+          xSemaphoreGive(gMutex);
+        }
+        enqueueRs(NODE_MEGA_ACT, "CMD_RUN_AUTO");
+      }
+
+      // MANUAL
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_b5Stop) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.estop = true;
+          g.autoRunning = false;
+          xSemaphoreGive(gMutex);
+        }
+        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManDoor) {
+        // button toggle state tidak bisa dibaca dari 0x65.
+        // default: treat as toggle local, kirim sesuai local state.
+        bool open;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.manDirOpen = !g.manDirOpen;
+          open = g.manDirOpen;
+          xSemaphoreGive(gMutex);
+        } else {
+          open = true;
+        }
+        enqueueRs(NODE_MEGA_ACT, open ? "MAINDOOR_OPEN" : "MAINDOOR_CLOSE");
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManBDoor) {
+        bool open;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.manDirOpen = !g.manDirOpen;
+          open = g.manDirOpen;
+          xSemaphoreGive(gMutex);
+        } else {
+          open = true;
+        }
+        enqueueRs(NODE_MEGA_ACT, open ? "BDOOR_OPEN" : "BDOOR_CLOSE");
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManPush) {
+        bool maju;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.manDirOpen = !g.manDirOpen;
+          maju = g.manDirOpen;
+          xSemaphoreGive(gMutex);
+        } else {
+          maju = true;
+        }
+        enqueueRs(NODE_MEGA_ACT, maju ? "PUSHER_MAJU" : "PUSHER_MUNDUR");
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_bManCon) {
+        // Tanpa script, kita tidak tahu value multi-state dari Nextion.
+        // Solusi plug-n-play: cycle state lokal: STOP -> FWD -> REV -> STOP ...
+        static uint8_t convMode = 0; // 0 stop, 1 fwd, 2 rev
+        convMode = (uint8_t)((convMode + 1) % 3);
+        if (convMode == 0) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_STOP");
+        else if (convMode == 1) enqueueRs(NODE_MEGA_ACT, "CONVEYOR_FWD");
+        else enqueueRs(NODE_MEGA_ACT, "CONVEYOR_REV");
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_btManIgn) {
+        // toggle local
+        static uint8_t ign = 0;
+        ign ^= 1;
+        enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_IGN:") + String((int)ign));
+      }
+      else if (page == NEX_PAGE_MANUAL && comp == NEX_CID_btManBum) {
+        static uint8_t burn = 0;
+        burn ^= 1;
+        enqueueRs(NODE_MEGA_ACT, String("CMD_MAN_BURN:") + String((int)burn));
+      }
+
+      // SETTINGS
+      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bsettingStop) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.estop = true;
+          g.autoRunning = false;
+          xSemaphoreGive(gMutex);
+        }
+        enqueueRs(NODE_MEGA_ACT, "CMD_EMERGENCY_STOP");
+      }
+      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bSave) {
+        float setTemp; uint32_t setTime; float setBatch; float setVol;
+        int b1, b2;
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          setTemp = g.setTemp;
+          setTime = g.setTimeSec;
+          setBatch = g.setBatchKg;
+          setVol = g.setVolume;
+          b1 = g.blowerAirLvl;
+          b2 = g.blowerCoolLvl;
+          xSemaphoreGive(gMutex);
+        }
+        enqueueRs(NODE_MEGA_ACT, String("SET_TE:") + String(setTemp, 1));
+        enqueueRs(NODE_MEGA_ACT, String("SET_TI:") + String((unsigned)setTime));
+        enqueueRs(NODE_MEGA_ACT, String("SET_W:")  + String(setBatch, 2));
+        (void)setVol; // volume placeholder
+        enqueueRs(NODE_MEGA_ACT, String("BLOW:air:") + String(b1));
+        enqueueRs(NODE_MEGA_ACT, String("BLOW:cool:") + String(b2));
+      }
+      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bReset) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.setTemp = 1200.0f;
+          g.setTimeSec = 30;
+          g.setBatchKg = 5.0f;
+          g.setVolume = 0;
+          g.blowerAirLvl = 0;
+          g.blowerCoolLvl = 0;
+          xSemaphoreGive(gMutex);
+        }
+      }
+      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bBlow1) {
+        // cycle blower air lvl: 0->1->2->0
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.blowerAirLvl = (g.blowerAirLvl + 1) % 3;
+          xSemaphoreGive(gMutex);
+        }
+      }
+      else if (page == NEX_PAGE_SETTINGS && comp == NEX_CID_bBlow2) {
+        if (xSemaphoreTake(gMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+          g.blowerCoolLvl = (g.blowerCoolLvl + 1) % 3;
+          xSemaphoreGive(gMutex);
+        }
+      }
+
+      // numeric widgets (nTempSet/nTimeSet/t2/t1/hManSpeed/hManStep)
+      // Tanpa script, Nextion tidak otomatis push value ke MCU hanya lewat 0x65.
+      // Plug-n-play approach: biarkan user edit, MCU tetap punya state internal.
+      // Nilai tetap dikirim saat SAVE via g.* (yang bisa kamu update lewat cara lain bila mau).
     }
+
+    // Optional: drain bytes lain agar tidak numpuk jika Nextion spam return codes
+    // (tidak wajib, tapi aman)
+    if (nexSerial.available() > 128) {
+      nexDrainNonTouchReturns(2);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
@@ -639,8 +700,8 @@ static void taskUiRender(void *pv) {
     enqueueUiTxt(OBJ_M_WEIGHT, fmt2(s.weightKg));
 
     // SETTINGS snapshot
-    enqueueUiTxt(OBJ_S_TSET, String(s.setTemp, 0));
-    enqueueUiTxt(OBJ_S_TIME, String((unsigned)s.setTimeSec));
+    enqueueUiNum(OBJ_S_TSET, (int)roundf(s.setTemp));
+    enqueueUiNum(OBJ_S_TIME, (int)s.setTimeSec);
     enqueueUiTxt(OBJ_S_WB, String(s.setBatchKg, 1));
     enqueueUiTxt(OBJ_S_VOL, String(s.setVolume, 1));
 
@@ -661,7 +722,6 @@ static void taskUiRender(void *pv) {
 // BOOT INIT HMI (optional)
 // ======================
 static void hmiBootInit() {
-  // optional: set initial fields so UI gak kosong
   nexCmd("page 0");
   nexSetTxt(OBJ_D_STAT, "IDLE");
   nexSetTxt(OBJ_D_TEMP, "IDLE");
@@ -677,7 +737,6 @@ static void hmiBootInit() {
 // SETUP / LOOP
 // ======================
 void setup() {
-  // serial debug
   Serial.begin(115200);
   delay(200);
 
@@ -722,7 +781,6 @@ void setup() {
 }
 
 void loop() {
-  // Master real work is done in FreeRTOS tasks.
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
